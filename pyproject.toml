@@ -1,0 +1,19 @@
+[project]
+name = "comfyui-latentsync-enhanced"
+description = "Enhanced LatentSync lip-sync node: no-face-safe, loads models from ComfyUI checkpoints, OOM-guard chunking for 24 GB VRAM."
+version = "1.0.0"
+license = {file = "LICENSE"}
+classifiers = [
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/GuardSkill/ComfyUI-LatentSyncEnhanced"
+"Bug Tracker" = "https://github.com/GuardSkill/ComfyUI-LatentSyncEnhanced/issues"
+
+[tool.comfy]
+PublisherId = "guardskill"
+DisplayName = "ComfyUI LatentSync Enhanced"
+Icon = ""
+includes = []
