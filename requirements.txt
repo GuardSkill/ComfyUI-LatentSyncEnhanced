@@ -1,0 +1,10 @@
+torch
+torchaudio
+torchvision
+numpy
+tqdm
+soundfile
+omegaconf
+einops
+diffusers>=0.24.0
+accelerate

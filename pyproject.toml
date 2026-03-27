@@ -6,7 +6,18 @@ license = {file = "LICENSE"}
 classifiers = [
     "Operating System :: OS Independent",
 ]
-dependencies = []
+dependencies = [
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "numpy",
+    "tqdm",
+    "soundfile",
+    "omegaconf",
+    "einops",
+    "diffusers>=0.24.0",
+    "accelerate",
+]
 
 [project.urls]
 Repository = "https://github.com/GuardSkill/ComfyUI-LatentSyncEnhanced"
