@@ -15,22 +15,8 @@ Improvements over the original wrapper:
 
 ## Prerequisites
 
-**ComfyUI-LatentSyncWrapper must be installed alongside this node.**
-
-This node imports the `latentsync` Python package from the original wrapper. Install it first:
-
-```
-ComfyUI/custom_nodes/
-├── ComfyUI-LatentSyncWrapper/   ← required dependency
-└── ComfyUI-LatentSyncEnhanced/  ← this node
-```
-
-Install the wrapper via [ComfyUI Manager](https://github.com/ltdrdata/ComfyUI-Manager) or clone it manually:
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/ShmuelRonen/ComfyUI-LatentSyncWrapper
-```
+This node is **fully self-contained** — no other custom nodes are required.
+The `latentsync` inference library is bundled directly inside this package.
 
 ---
 
