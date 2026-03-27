@@ -28,31 +28,13 @@ from einops import rearrange
 import folder_paths
 
 # ---------------------------------------------------------------------------
-# Locate the original wrapper so we can import its latentsync package
+# Make this node's own latentsync package importable (self-contained)
 # ---------------------------------------------------------------------------
 
-def _get_wrapper_dir() -> str:
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    # Sibling custom_nodes directory (most common layout)
-    candidate = os.path.join(os.path.dirname(this_dir), "ComfyUI-LatentSyncWrapper")
-    if os.path.isdir(candidate):
-        return candidate
-    # Fallback: search existing sys.path entries
-    for p in sys.path:
-        c = os.path.join(p, "custom_nodes", "ComfyUI-LatentSyncWrapper")
-        if os.path.isdir(c):
-            return c
-    raise FileNotFoundError(
-        "ComfyUI-LatentSyncWrapper not found. "
-        "Please install it alongside ComfyUI-LatentSyncEnhanced."
-    )
+_NODE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _NODE_DIR not in sys.path:
+    sys.path.insert(0, _NODE_DIR)
 
-
-WRAPPER_DIR = _get_wrapper_dir()
-if WRAPPER_DIR not in sys.path:
-    sys.path.insert(0, WRAPPER_DIR)
-
-# Now import from the original wrapper's latentsync package
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from latentsync.utils.image_processor import ImageProcessor, load_fixed_mask
 from latentsync.utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
@@ -559,12 +541,12 @@ class LatentSyncEnhancedNode:
             resampled_audio = {"waveform": waveform.unsqueeze(0).cpu(), "sample_rate": sample_rate}
 
             # ── Load config ─────────────────────────────────────────────
-            config_512 = os.path.join(WRAPPER_DIR, "configs", "unet", "stage2_512.yaml")
-            config_256 = os.path.join(WRAPPER_DIR, "configs", "unet", "stage2.yaml")
+            config_512 = os.path.join(_NODE_DIR, "configs", "unet", "stage2_512.yaml")
+            config_256 = os.path.join(_NODE_DIR, "configs", "unet", "stage2.yaml")
             config_path = config_512 if os.path.exists(config_512) else config_256
             config = OmegaConf.load(config_path)
 
-            mask_image_path = os.path.join(WRAPPER_DIR, "latentsync", "utils", "mask.png")
+            mask_image_path = os.path.join(_NODE_DIR, "latentsync", "utils", "mask.png")
             if not os.path.exists(mask_image_path):
                 raise FileNotFoundError(f"Mask image not found: {mask_image_path}")
 
