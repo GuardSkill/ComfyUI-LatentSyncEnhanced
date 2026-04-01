@@ -361,7 +361,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         cmd = (
             f"ffmpeg -y -loglevel error -nostdin "
             f"-i {tmp_video} -i {tmp_audio} "
-            f"-c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 "
+            f"-c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 -shortest "
             f"{video_out_path}"
         )
         subprocess.run(cmd, shell=True)
