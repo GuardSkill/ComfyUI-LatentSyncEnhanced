@@ -361,7 +361,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         tmp_video = os.path.join(out_dir, "_enhanced_tmp_video.mp4")
         tmp_audio = os.path.join(out_dir, "_enhanced_tmp_audio.wav")
 
-        write_video(tmp_video, synced_video_frames, fps=25)
+        write_video(tmp_video, synced_video_frames, fps=video_fps)
         sf.write(tmp_audio, audio_np, audio_sample_rate)
 
         cmd = (
@@ -410,6 +410,13 @@ class LatentSyncEnhancedNode:
                         "80 ≈ 3.2 s @25 fps and is safe for 24 GB VRAM. "
                         "Reduce if you still hit OOM; increase for speed."
                     ),
+                }),
+                "video_fps":        ("FLOAT", {
+                    "default": 25.0,
+                    "min": 1.0,
+                    "max": 120.0,
+                    "step": 0.001,
+                    "tooltip": "FPS of the input video frames. Must match the source video fps (e.g. 23.976, 24, 25, 29.97, 30).",
                 }),
             }
         }
@@ -494,7 +501,7 @@ class LatentSyncEnhancedNode:
 
     # ------------------------------------------------------------------
 
-    def inference(self, images, audio, seed, lips_expression, inference_steps, chunk_frames):
+    def inference(self, images, audio, seed, lips_expression, inference_steps, chunk_frames, video_fps):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         use_fp16 = False
 
@@ -529,10 +536,10 @@ class LatentSyncEnhancedNode:
 
             try:
                 import torchvision.io as tio
-                tio.write_video(temp_video_path, frames_uint8, fps=25, video_codec="h264")
+                tio.write_video(temp_video_path, frames_uint8, fps=video_fps, video_codec="h264")
             except Exception:
                 import imageio
-                imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=25, macro_block_size=1)
+                imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=video_fps, macro_block_size=1)
 
             # ── Prepare input audio ─────────────────────────────────────
             waveform    = audio["waveform"]
@@ -583,6 +590,7 @@ class LatentSyncEnhancedNode:
                 height=config.data.resolution,
                 mask_image_path=mask_image_path,
                 chunk_frames=chunk_frames,
+                video_fps=video_fps,
             )
 
             if torch.cuda.is_available():
