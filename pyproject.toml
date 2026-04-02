@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-latentsync-enhanced"
 description = "Enhanced LatentSync lip-sync node: no-face-safe, loads models from ComfyUI checkpoints, OOM-guard chunking for 24 GB VRAM."
-version = "1.0.3"
+version = "1.0.4"
 license = {file = "LICENSE"}
 classifiers = [
     "Operating System :: OS Independent",

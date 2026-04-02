@@ -234,9 +234,15 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         )
         audio_samples = read_audio(audio_path)
 
+        # Use actual audio duration (samples) as ground truth for target frame count.
+        # whisper_chunks can be longer than the real audio because Whisper pads short
+        # audio to its 30-second context window before encoding.
+        actual_audio_frames = int(len(audio_samples) / audio_sample_rate * video_fps)
+        whisper_chunks = whisper_chunks[:actual_audio_frames]
+
         # ── Video (loop to match audio, no face detection yet) ──────────
         video_frames = read_video(video_path, use_decord=False)
-        video_frames = self._loop_frames_only(video_frames, len(whisper_chunks))
+        video_frames = self._loop_frames_only(video_frames, actual_audio_frames)
 
         total_frames = len(video_frames)
         num_channels_latents = self.vae.config.latent_channels
