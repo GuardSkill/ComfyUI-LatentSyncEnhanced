@@ -44,7 +44,9 @@ class FaceDetector:
             return None, None
         else:
             face = get_face_store
-            lmk = np.round(face.landmark_2d_106).astype(np.int_)
+            # Keep detector precision for downstream pose and geometry metadata.
+            detector_landmarks = np.asarray(face.landmark_2d_106, dtype=np.float32).copy()
+            lmk = np.round(detector_landmarks).astype(np.int_)
 
             halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)  # lmk[73]
 
@@ -66,7 +68,7 @@ class FaceDetector:
             x2 = min(f_w, x2)
             y2 = min(f_h, y2)
 
-            return (x1, y1, x2, y2), lmk
+            return (x1, y1, x2, y2), detector_landmarks
 
 
 def cuda_to_int(cuda_str: str) -> int:

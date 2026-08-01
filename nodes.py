@@ -100,26 +100,45 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             None when *every* frame in the segment has no face.
         boxes : list[list] | None
         matrices : list | None
+        yaws : list[float] | None
+        original_landmarks : list[np.ndarray] | None
+        aligned_landmarks : list[np.ndarray] | None
         no_face_set : set[int]
             Indices (within this segment) of frames where no face was found.
         """
         faces, boxes, matrices = [], [], []
+        yaws, original_landmarks, aligned_landmarks = [], [], []
         no_face_indices = []
 
         for i, frame in enumerate(tqdm.tqdm(video_frames, desc="Face detection", leave=False)):
             frame_index = frame_offset + i
             save_artifact_image("original_frame", frame_index, frame, "zero_255")
             try:
-                face, box, matrix = self.image_processor.affine_transform(frame)
+                (
+                    face,
+                    box,
+                    matrix,
+                    yaw,
+                    detector_landmarks,
+                    landmarks,
+                ) = self.image_processor.affine_transform(
+                    frame, return_mask_geometry=True, frame_index=frame_index
+                )
                 save_artifact_image("aligned_face", frame_index, face, "zero_255")
                 faces.append(face)
                 boxes.append(box)
                 matrices.append(matrix)
+                yaws.append(yaw)
+                original_landmarks.append(detector_landmarks)
+                aligned_landmarks.append(landmarks)
             except RuntimeError as e:
                 if "Face not detected" in str(e):
                     faces.append(None)
                     boxes.append(None)
                     matrices.append(None)
+                    yaws.append(None)
+                    original_landmarks.append(None)
+                    aligned_landmarks.append(None)
                     no_face_indices.append(i)
                 else:
                     raise
@@ -141,7 +160,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 "[LatentSyncEnhanced] WARNING: No faces detected in this segment. "
                 "Passing through original frames unchanged (no lip-sync applied)."
             )
-            return None, None, None, no_face_set
+            return None, None, None, None, None, None, no_face_set
 
         # Fill no-face slots with data from the nearest frame that has a face
         # (only used as diffusion input; output will still be the original frame)
@@ -150,11 +169,17 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             faces[idx] = faces[nearest]
             boxes[idx] = boxes[nearest]
             matrices[idx] = matrices[nearest]
+            yaws[idx] = yaws[nearest]
+            original_landmarks[idx] = original_landmarks[nearest]
+            aligned_landmarks[idx] = aligned_landmarks[nearest]
             save_artifact_image(
                 "aligned_face", frame_offset + idx, faces[idx], "zero_255"
             )
 
-        return torch.stack(faces), boxes, matrices, no_face_set
+        return (
+            torch.stack(faces), boxes, matrices, yaws,
+            original_landmarks, aligned_landmarks, no_face_set,
+        )
 
     # ------------------------------------------------------------------
     # Restoration helper
@@ -218,6 +243,28 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     # ------------------------------------------------------------------
     # Main __call__ — segment-based, OOM-safe
     # ------------------------------------------------------------------
+
+    def _prepare_node_inference_masks(
+        self,
+        inference_faces,
+        *,
+        segment_index,
+        window_start,
+        segment_start,
+        yaws,
+        original_landmarks,
+        aligned_landmarks,
+    ):
+        """Forward the complete per-frame metadata for one inference window."""
+        return self.image_processor.prepare_masks_and_masked_images(
+            inference_faces,
+            affine_transform=False,
+            yaws=yaws,
+            aligned_landmarks=aligned_landmarks,
+            frame_offset=segment_start + window_start,
+            original_landmarks=original_landmarks,
+            metadata_required=True,
+        )
 
     @torch.no_grad()
     def __call__(
@@ -343,7 +390,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 f"({seg_end - seg_start} frames)..."
             )
 
-            seg_faces, seg_boxes, seg_matrices, no_face_set = \
+            seg_faces, seg_boxes, seg_matrices, seg_yaws, seg_original_landmarks, seg_landmarks, no_face_set = \
                 self._safe_affine_transform_segment(seg_video, frame_offset=seg_start)
 
             if seg_faces is None:
@@ -375,10 +422,20 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                     audio_embeds = None
 
                 inference_faces = seg_faces[i * num_frames : (i + 1) * num_frames]
+                inference_yaws = seg_yaws[i * num_frames : (i + 1) * num_frames]
+                inference_landmarks = seg_landmarks[i * num_frames : (i + 1) * num_frames]
+                inference_original_landmarks = seg_original_landmarks[i * num_frames : (i + 1) * num_frames]
                 latents         = seg_latents[:, :, i * num_frames : (i + 1) * num_frames]
 
-                ref_pv, masked_pv, masks = self.image_processor.prepare_masks_and_masked_images(
-                    inference_faces, affine_transform=False
+                window_start = i * num_frames
+                ref_pv, masked_pv, masks = self._prepare_node_inference_masks(
+                    inference_faces,
+                    segment_index=seg_start // chunk_frames,
+                    window_start=window_start,
+                    segment_start=seg_start,
+                    yaws=inference_yaws,
+                    original_landmarks=inference_original_landmarks,
+                    aligned_landmarks=inference_landmarks,
                 )
                 mask_latents, masked_img_latents = self.prepare_mask_latents(
                     masks, masked_pv, height, width, weight_dtype, device, generator, do_cfg
@@ -432,7 +489,6 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 # Decode and restore one bounded batch at a time.  In CPU
                 # offload mode every operation after VAE.decode is explicitly
                 # CPU-owned, so no CUDA tensor is retained by synced_chunk.
-                window_start = i * num_frames
                 for decode_start, decode_end in iter_frame_batches(
                     latents.shape[2], decode_batch_size
                 ):
@@ -489,7 +545,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             all_synced_frames.append(np.concatenate(synced_chunk, axis=0))
 
             # Aggressively free segment allocations
-            del seg_faces, seg_boxes, seg_matrices, seg_latents, synced_chunk
+            del seg_faces, seg_boxes, seg_matrices, seg_yaws, seg_original_landmarks, seg_landmarks, seg_latents, synced_chunk
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
