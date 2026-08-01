@@ -95,6 +95,7 @@ positive integer (for example `2`) when more VRAM is available. DeepCache is
 disabled automatically on GPUs with 16 GB or less; override this with
 `LATENTSYNC_ENABLE_DEEPCACHE=1`. `LATENTSYNC_MEMORY_FRACTION` is optional and
 only applies when explicitly set.
+
 For device-path diagnosis, set `LATENTSYNC_COMPOSITION_DEVICE` and/or
 `LATENTSYNC_RESTORE_DEVICE` to `cpu` or `cuda`. CPU uses float32; CUDA uses the
 loaded model's weight dtype. If unset, both preserve the normal low-VRAM CPU
@@ -103,45 +104,56 @@ normal default.
 
 ---
 
-### Yaw-aware mask and facial contour controls
+### Yaw-aware mouth mask controls
 
-The canonical editable mask is adapted continuously for profile faces using
-the signed yaw estimated from the detector landmarks. The editable region is
-also intersected with the visible facial-contour polygon before diffusion.
-These optional environment variables control the formal adaptation:
+Near-profile mouth masks are adapted continuously from the detected landmarks.
+These optional environment variables tune the adaptation; shrink and shift are
+fractions of the aligned-face width:
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `LATENTSYNC_MOUTH_YAW_THRESHOLD` | `0.12` | Normalized yaw below which the canonical mask is unchanged |
 | `LATENTSYNC_MOUTH_MAX_HORIZONTAL_SHRINK` | `0.35` | Maximum horizontal shrink fraction |
 | `LATENTSYNC_MOUTH_MAX_HORIZONTAL_SHIFT` | `0.10` | Maximum horizontal shift fraction |
-| `LATENTSYNC_MOUTH_CONTOUR_FEATHER` | `0.02` | Facial-contour feather width as a fraction of crop size |
-| `LATENTSYNC_MOUTH_MAX_EDITABLE_COVERAGE` | `0.18` | Maximum fraction of the aligned crop that may be edited |
+| `LATENTSYNC_MOUTH_CONTOUR_FEATHER` | `0.02` | Face-contour feather width as a fraction of crop size |
+| `LATENTSYNC_MOUTH_ROI_MODE` | `expanded` | Production `expanded` contextual polygon, or `tight` debug/ablation polygon |
+| `LATENTSYNC_MOUTH_ROI_HORIZONTAL_PADDING` | `0.24` | Per-side horizontal padding as a fraction of outer-lip width |
+| `LATENTSYNC_MOUTH_ROI_UPPER_PADDING` | `0.28` | Upper contextual padding as a fraction of outer-lip height |
+| `LATENTSYNC_MOUTH_ROI_LOWER_PADDING` | `0.45` | Lower contextual padding as a fraction of outer-lip height |
+| `LATENTSYNC_MOUTH_DILATION_FRACTION` | `0.06` | Bounded elliptical dilation radius as a fraction of mouth size |
+| `LATENTSYNC_MOUTH_FEATHER_FRACTION` | `0.08` | Gaussian feather radius as a fraction of mouth size |
+| `LATENTSYNC_MOUTH_ROI_MAX_COVERAGE` | `0.12` | Maximum valid landmark-derived ROI fraction of the aligned crop |
 
-Invalid values warn and fall back to the documented defaults. Mask polarity is
-`0 = editable` and `1 = preserved`; contour clipping only removes editable
-pixels outside the detected face polygon.
+Invalid or out-of-range values emit a warning and use the documented default.
+The production default is the expanded polygon: it uses the cyclic JD/InsightFace outer-lip indices
+`[52, 64, 63, 71, 67, 68, 61, 58, 59, 53, 56, 55]`, then applies bounded
+morphological dilation and Gaussian feathering. Its default padding is 0.24
+horizontally, 0.28 above, and 0.45 below, targeting roughly 10--14% editable
+coverage. The final editable strength is intersected with the yaw-adapted mask
+and facial-contour mask, so the contextual expansion cannot reach the eyes,
+chin, hands, sleeves, or background outside the detected face. Invalid mouth
+geometry uses the original canonical mouth mask. The diffusion polarity is
+`0 = editable` and `1 = preserved`.
 
-### Landmark-shaped mouth ROI controls
+### Dual-mask architecture
 
-The production mouth region is rasterized from the ordered JD/InsightFace
-outer-lip landmarks (`52, 64, 63, 71, 67, 68, 61, 58, 59, 53, 56, 55`).
-Padding is relative to the detected lip bounds, followed by bounded elliptical
-dilation and Gaussian feathering. Centroid, eye, chin, and coverage checks make
-invalid geometry fall back to the canonical editable mouth mask.
+The production path deliberately keeps three masks separate:
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `LATENTSYNC_MOUTH_HORIZONTAL_PADDING` | `0.12` | Relative padding on each horizontal side |
-| `LATENTSYNC_MOUTH_UPPER_PADDING` | `0.20` | Relative padding above the outer lip |
-| `LATENTSYNC_MOUTH_LOWER_PADDING` | `0.30` | Relative padding below the outer lip |
-| `LATENTSYNC_MOUTH_DILATION_FRACTION` | `0.06` | Bounded dilation radius relative to mouth size |
-| `LATENTSYNC_MOUTH_FEATHER_FRACTION` | `0.08` | Gaussian feather radius relative to mouth size |
-| `LATENTSYNC_MOUTH_MAX_ROI_COVERAGE` | `0.08` | Hard cap for valid mouth-ROI crop coverage |
+| Mask | Polarity | Used at |
+|------|----------|---------|
+| conditioning_mask | `1 = preserved`, `0 = editable` | Original canonical LatentSync mask passed to prepare_mask_latents(), masked-image VAE preparation, and UNet conditioning |
+| composition_editable_mask | `1 = decoded pixel`, `0 = reference pixel` | Post-VAE composition only; may use yaw, facial contour, and tight/expanded polygon ROI |
+| restoration_blend_mask | Restoration geometry | Inverse-affine face restoration only |
 
-These controls affect only the editable-mask intersection. The final editable
-strength remains a subset of the yaw-adapted mask, mouth ROI, and facial
-contour mask.
+The composition mask is never used as a UNet conditioning mask. The production
+default is canonical conditioning plus the expanded yaw-aware,
+contour-clipped mouth composition mask.
+Set `LATENTSYNC_MOUTH_ROI_MODE=tight` only for debug or ablation comparisons;
+it is not the production default. The older padding names
+`LATENTSYNC_MOUTH_HORIZONTAL_PADDING`, `LATENTSYNC_MOUTH_UPPER_PADDING`,
+`LATENTSYNC_MOUTH_LOWER_PADDING`, and `LATENTSYNC_MOUTH_MAX_ROI_COVERAGE`
+remain compatibility aliases, but the ROI-prefixed names take precedence.
+
 
 ---
 

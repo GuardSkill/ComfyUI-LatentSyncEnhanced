@@ -27,6 +27,8 @@ from einops import rearrange
 
 import folder_paths
 
+
+
 # ---------------------------------------------------------------------------
 # Make this node's own latentsync package importable (self-contained)
 # ---------------------------------------------------------------------------
@@ -54,6 +56,22 @@ from latentsync.models.unet import UNet3DConditionModel
 from latentsync.whisper.audio2feature import Audio2Feature
 from diffusers import AutoencoderKL, DDIMScheduler
 from accelerate.utils import set_seed
+
+
+def _build_masked_pixel_values(reference_pixel_values, conditioning_mask, *, role):
+    """Construct masked-image pixels from the canonical conditioning mask."""
+    del role
+    assert reference_pixel_values is not None
+    assert conditioning_mask is not None
+    assert reference_pixel_values.ndim == 4
+    assert conditioning_mask.ndim == 4
+    assert reference_pixel_values.shape[0] == conditioning_mask.shape[0]
+    assert conditioning_mask.shape[1] == 1
+    masked_pixel_values = reference_pixel_values * conditioning_mask
+    assert masked_pixel_values is not None
+    assert masked_pixel_values.shape == reference_pixel_values.shape
+    assert torch.isfinite(masked_pixel_values).all()
+    return masked_pixel_values
 
 
 # ---------------------------------------------------------------------------
@@ -100,28 +118,17 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             None when *every* frame in the segment has no face.
         boxes : list[list] | None
         matrices : list | None
-        yaws : list[float] | None
-        original_landmarks : list[np.ndarray] | None
-        aligned_landmarks : list[np.ndarray] | None
         no_face_set : set[int]
             Indices (within this segment) of frames where no face was found.
         """
-        faces, boxes, matrices = [], [], []
-        yaws, original_landmarks, aligned_landmarks = [], [], []
+        faces, boxes, matrices, yaws, original_landmarks, aligned_landmarks = [], [], [], [], [], []
         no_face_indices = []
 
         for i, frame in enumerate(tqdm.tqdm(video_frames, desc="Face detection", leave=False)):
             frame_index = frame_offset + i
             save_artifact_image("original_frame", frame_index, frame, "zero_255")
             try:
-                (
-                    face,
-                    box,
-                    matrix,
-                    yaw,
-                    detector_landmarks,
-                    landmarks,
-                ) = self.image_processor.affine_transform(
+                face, box, matrix, yaw, detector_landmarks, landmarks = self.image_processor.affine_transform(
                     frame, return_mask_geometry=True, frame_index=frame_index
                 )
                 save_artifact_image("aligned_face", frame_index, face, "zero_255")
@@ -175,11 +182,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             save_artifact_image(
                 "aligned_face", frame_offset + idx, faces[idx], "zero_255"
             )
-
-        return (
-            torch.stack(faces), boxes, matrices, yaws,
-            original_landmarks, aligned_landmarks, no_face_set,
-        )
+        return torch.stack(faces), boxes, matrices, yaws, original_landmarks, aligned_landmarks, no_face_set
 
     # ------------------------------------------------------------------
     # Restoration helper
@@ -245,18 +248,35 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     # ------------------------------------------------------------------
 
     def _prepare_node_inference_masks(
-        self,
-        inference_faces,
-        *,
-        segment_index,
-        window_start,
-        segment_start,
-        yaws,
-        original_landmarks,
-        aligned_landmarks,
+        self, inference_faces, *, segment_index, window_start, segment_start,
+        yaws, original_landmarks, aligned_landmarks,
     ):
-        """Forward the complete per-frame metadata for one inference window."""
-        return self.image_processor.prepare_masks_and_masked_images(
+        """Build canonical conditioning and post-decode composition masks."""
+        del segment_index
+        frame_indices = [segment_start + window_start + n for n in range(len(inference_faces))]
+        metadata = {
+            "frame_indices": frame_indices,
+            "yaw_values": yaws,
+            "original_landmarks": original_landmarks,
+            "aligned_landmarks": aligned_landmarks,
+        }
+        lengths = {key: None if value is None else len(value) for key, value in metadata.items()}
+        if any(value is None for value in metadata.values()) or any(
+            length != len(inference_faces) for length in lengths.values()
+        ):
+            raise RuntimeError(f"Missing or misaligned production metadata: lengths={lengths}")
+        for frame_index, yaw, original, aligned in zip(
+            frame_indices, yaws, original_landmarks, aligned_landmarks
+        ):
+            if yaw is None or not np.isfinite(yaw):
+                raise RuntimeError(f"Invalid signed yaw for frame {frame_index}")
+            original = np.asarray(original)
+            aligned = np.asarray(aligned)
+            if original.shape != (106, 2) or not np.isfinite(original).all():
+                raise RuntimeError(f"Invalid detector-space landmarks for frame {frame_index}")
+            if aligned.shape != (106, 2) or not np.isfinite(aligned).all():
+                raise RuntimeError(f"Invalid aligned landmarks for frame {frame_index}")
+        mask_batch = self.image_processor.prepare_dual_masks_and_masked_images(
             inference_faces,
             affine_transform=False,
             yaws=yaws,
@@ -265,6 +285,63 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             original_landmarks=original_landmarks,
             metadata_required=True,
         )
+        ref_pv = mask_batch.reference_pixel_values
+        conditioning_mask = mask_batch.conditioning_mask
+        masked_pv_canonical = _build_masked_pixel_values(
+            ref_pv, conditioning_mask, role="canonical"
+        )
+        assert masked_pv_canonical is not None
+        assert masked_pv_canonical.shape == ref_pv.shape
+        assert torch.isfinite(masked_pv_canonical).all()
+        canonical_source = self.image_processor.mask_image.to(
+            device=conditioning_mask.device, dtype=conditioning_mask.dtype
+        )
+        if canonical_source.ndim == 3:
+            canonical_source = canonical_source.unsqueeze(0)
+        if not torch.equal(conditioning_mask, canonical_source.expand_as(conditioning_mask)):
+            raise RuntimeError("conditioning_mask deviated from the original canonical LatentSync mask")
+        if not torch.allclose(masked_pv_canonical, mask_batch.masked_reference_pixel_values, atol=1e-4, rtol=0.0):
+            raise RuntimeError("masked_reference_pixel_values were not built from conditioning_mask")
+        return mask_batch
+
+    @torch.no_grad()
+    def _denoise_window(
+        self,
+        latents,
+        conditioning_mask_latents,
+        conditioning_masked_image_latents,
+        reference_latents,
+        audio_embeds,
+        timesteps,
+        num_inference_steps,
+        guidance_scale,
+        extra_step_kwargs,
+        callback=None,
+        callback_steps=1,
+    ):
+        """Run the unchanged denoising equations for one canonical condition."""
+        do_cfg = guidance_scale > 1.0
+        num_warmup = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as pbar:
+            for j, timestep in enumerate(timesteps):
+                unet_in = torch.cat([latents] * 2) if do_cfg else latents
+                unet_in = self.scheduler.scale_model_input(unet_in, timestep)
+                unet_in = torch.cat(
+                    [unet_in, conditioning_mask_latents, conditioning_masked_image_latents, reference_latents],
+                    dim=1,
+                )
+                noise_pred = self.unet(unet_in, timestep, encoder_hidden_states=audio_embeds).sample
+                if do_cfg:
+                    noise_uncond, noise_audio = noise_pred.chunk(2)
+                    noise_pred = noise_uncond + guidance_scale * (noise_audio - noise_uncond)
+                latents = self.scheduler.step(noise_pred, timestep, latents, **extra_step_kwargs).prev_sample
+                if j == len(timesteps) - 1 or (
+                    (j + 1) > num_warmup and (j + 1) % self.scheduler.order == 0
+                ):
+                    pbar.update()
+                    if callback is not None and j % callback_steps == 0:
+                        callback(j, timestep, latents)
+        return latents
 
     @torch.no_grad()
     def __call__(
@@ -293,7 +370,6 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     ):
         is_train = self.unet.training
         self.unet.eval()
-
         check_ffmpeg_installed()
 
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -428,7 +504,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 latents         = seg_latents[:, :, i * num_frames : (i + 1) * num_frames]
 
                 window_start = i * num_frames
-                ref_pv, masked_pv, masks = self._prepare_node_inference_masks(
+                mask_batch = self._prepare_node_inference_masks(
                     inference_faces,
                     segment_index=seg_start // chunk_frames,
                     window_start=window_start,
@@ -437,42 +513,70 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                     original_landmarks=inference_original_landmarks,
                     aligned_landmarks=inference_landmarks,
                 )
-                mask_latents, masked_img_latents = self.prepare_mask_latents(
-                    masks, masked_pv, height, width, weight_dtype, device, generator, do_cfg
+                ref_pv = mask_batch.reference_pixel_values
+                conditioning_mask = mask_batch.conditioning_mask
+                composition_editable_mask = mask_batch.composition_editable_mask
+                masked_pv_canonical = _build_masked_pixel_values(
+                    ref_pv,
+                    conditioning_mask,
+                    role="canonical",
+                )
+                assert masked_pv_canonical is not None
+                assert masked_pv_canonical.shape == ref_pv.shape
+                assert torch.isfinite(masked_pv_canonical).all()
+                if not torch.allclose(
+                    masked_pv_canonical,
+                    mask_batch.masked_reference_pixel_values,
+                    atol=1e-4,
+                    rtol=0.0,
+                ):
+                    raise RuntimeError(
+                        "canonical masked pixel values diverged from ImageProcessor output"
+                    )
+                assert masked_pv_canonical is not None
+                assert masked_pv_canonical.shape == ref_pv.shape
+                assert torch.isfinite(masked_pv_canonical).all()
+                conditioning_mask_latents, conditioning_masked_image_latents = self.prepare_mask_latents(
+                    conditioning_mask,
+                    masked_pv_canonical,
+                    height,
+                    width,
+                    weight_dtype,
+                    device,
+                    generator,
+                    do_cfg,
+                    mask_role="conditioning",
                 )
                 ref_latents = self.prepare_image_latents(
                     ref_pv, device, weight_dtype, generator, do_cfg
                 )
 
-                # Denoising loop
-                num_warmup = len(timesteps) - num_inference_steps * self.scheduler.order
-                with self.progress_bar(total=num_inference_steps) as pbar:
-                    for j, t in enumerate(timesteps):
-                        unet_in = torch.cat([latents] * 2) if do_cfg else latents
-                        unet_in = self.scheduler.scale_model_input(unet_in, t)
-                        unet_in = torch.cat(
-                            [unet_in, mask_latents, masked_img_latents, ref_latents], dim=1
-                        )
-                        noise_pred = self.unet(
-                            unet_in, t, encoder_hidden_states=audio_embeds
-                        ).sample
-                        if do_cfg:
-                            noise_uncond, noise_audio = noise_pred.chunk(2)
-                            noise_pred = noise_uncond + guidance_scale * (noise_audio - noise_uncond)
-                        latents = self.scheduler.step(
-                            noise_pred, t, latents, **extra_step_kwargs
-                        ).prev_sample
-                        if j == len(timesteps) - 1 or (
-                            (j + 1) > num_warmup and (j + 1) % self.scheduler.order == 0
-                        ):
-                            pbar.update()
-                            if callback is not None and j % callback_steps == 0:
-                                callback(j, t, latents)
+                latents = self._denoise_window(
+                    latents,
+                    conditioning_mask_latents,
+                    conditioning_masked_image_latents,
+                    ref_latents,
+                    audio_embeds,
+                    timesteps,
+                    num_inference_steps,
+                    guidance_scale,
+                    extra_step_kwargs,
+                    callback=callback,
+                    callback_steps=callback_steps,
+                )
 
                 # The UNet no longer needs its conditioning tensors.  Delete
                 # them before entering VAE decode so their allocations cannot
                 # overlap the decoder's peak activation memory.
-                del masked_pv, mask_latents, masked_img_latents, ref_latents
+                assert masked_pv_canonical is not None
+                assert masked_pv_canonical.shape == ref_pv.shape
+                assert torch.isfinite(masked_pv_canonical).all()
+                del (
+                    masked_pv_canonical,
+                    conditioning_mask_latents,
+                    conditioning_masked_image_latents,
+                    ref_latents,
+                )
                 if audio_embeds is not None:
                     del audio_embeds
                 if "unet_in" in locals():
@@ -501,7 +605,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                     )
                     decoded = decoded.to(device=composition_device, dtype=composition_dtype)
                     ref_slice = ref_pv[decode_start:decode_end]
-                    mask_slice = masks[decode_start:decode_end]
+                    composition_slice = composition_editable_mask[decode_start:decode_end]
                     if artifact_debug_enabled():
                         for batch_index in range(decoded.shape[0]):
                             frame_index = window_start + decode_start + batch_index
@@ -515,7 +619,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                     composed = self.paste_surrounding_pixels_back(
                         decoded,
                         ref_slice,
-                        1 - mask_slice,
+                        composition_slice,
                         composition_device,
                         composition_dtype,
                     )
@@ -535,11 +639,18 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                         frame_offset=seg_start + window_start + decode_start,
                     )
                     synced_chunk.append(restored)
-                    del decoded, ref_slice, mask_slice, composed, restored
+                    del decoded, ref_slice, composition_slice, composed, restored
 
-                # ref_pv and masks are CPU storage tensors needed only for this
+                # ref_pv and the two independent mask tensors are CPU storage
+                # needed only for this
                 # window; release their references before the next window.
-                del ref_pv, masks, latents
+                del (
+                    ref_pv,
+                    conditioning_mask,
+                    composition_editable_mask,
+                    mask_batch,
+                    latents,
+                )
 
             # Restore faces → numpy output for this segment
             all_synced_frames.append(np.concatenate(synced_chunk, axis=0))
