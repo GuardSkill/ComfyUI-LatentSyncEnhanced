@@ -44,7 +44,11 @@ from latentsync.utils.util import (
     write_video,
     check_ffmpeg_installed,
 )
-from latentsync.utils.device_utils import iter_frame_batches, resolve_decode_batch_size
+from latentsync.utils.device_utils import (
+    iter_frame_batches,
+    resolve_decode_batch_size,
+    resolve_processing_device,
+)
 from latentsync.utils.debug_artifacts import artifact_debug_enabled, save_artifact_image
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.whisper.audio2feature import Audio2Feature
@@ -251,8 +255,21 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
 
         device = self._execution_device
         decode_batch_size = resolve_decode_batch_size(decode_batch_size)
-        composition_device = torch.device("cpu") if cpu_offload else device
-        composition_dtype = torch.float32 if cpu_offload else weight_dtype
+        default_aux_device = "cpu" if cpu_offload else device.type
+        composition_device = torch.device(resolve_processing_device(
+            os.getenv("LATENTSYNC_COMPOSITION_DEVICE"),
+            default_aux_device,
+            cuda_available=torch.cuda.is_available(),
+        ))
+        restore_device = torch.device(resolve_processing_device(
+            os.getenv("LATENTSYNC_RESTORE_DEVICE"),
+            default_aux_device,
+            cuda_available=torch.cuda.is_available(),
+        ))
+        composition_dtype = (
+            torch.float32 if composition_device.type == "cpu" else weight_dtype
+        )
+        restore_dtype = torch.float32 if restore_device.type == "cpu" else weight_dtype
         mask_image = load_fixed_mask(height, mask_image_path)
         self.image_processor = ImageProcessor(
             height,
@@ -260,13 +277,21 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             mask_image=mask_image,
             # Keep geometric restoration off CUDA when decoded faces are
             # streamed to CPU.  The detector may still use CUDA.
-            restore_device="cpu" if cpu_offload else str(device),
+            restore_device=str(restore_device),
+            restore_dtype=restore_dtype,
             detector_device=str(device),
         )
         print(
             "[LatentSyncEnhanced] Device policy: "
-            f"diffusion={device}, decode_batch_size={decode_batch_size}, "
-            f"composition/restoration={composition_device}"
+            f"diffusion={device}, decode_batch_size={decode_batch_size}"
+        )
+        print(
+            "[LatentSyncEnhanced] "
+            f"composition device/dtype: {composition_device}/{composition_dtype}"
+        )
+        print(
+            "[LatentSyncEnhanced] "
+            f"restoration device/dtype: {restore_device}/{restore_dtype}"
         )
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
@@ -438,8 +463,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                         composition_device,
                         composition_dtype,
                     )
-                    if cpu_offload:
-                        composed = composed.to(device="cpu", dtype=torch.float32)
+                    composed = composed.to(device=restore_device, dtype=restore_dtype)
 
                     local_no_face_set = {
                         index - decode_start

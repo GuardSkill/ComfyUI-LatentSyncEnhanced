@@ -7,8 +7,11 @@ from latentsync.utils.debug_artifacts import (
     artifact_debug_enabled,
     save_artifact_image,
 )
-from latentsync.utils.device_utils import iter_frame_batches, resolve_decode_batch_size
-
+from latentsync.utils.device_utils import (
+    iter_frame_batches,
+    resolve_decode_batch_size,
+    resolve_processing_device,
+)
 
 class LowVramHelperTests(unittest.TestCase):
     def test_decode_batch_size_is_positive_and_defensive(self):
@@ -20,6 +23,20 @@ class LowVramHelperTests(unittest.TestCase):
     def test_frame_batches_cover_frames_without_overlap(self):
         self.assertEqual(list(iter_frame_batches(7, 3)), [(0, 3), (3, 6), (6, 7)])
         self.assertEqual(list(iter_frame_batches(0, 3)), [])
+
+    def test_processing_device_preserves_default_without_override(self):
+        self.assertEqual(resolve_processing_device(None, "cpu", cuda_available=True), "cpu")
+        self.assertEqual(resolve_processing_device("", "cuda", cuda_available=True), "cuda")
+
+    def test_processing_device_accepts_supported_values(self):
+        self.assertEqual(resolve_processing_device(" CPU ", "cuda", cuda_available=True), "cpu")
+        self.assertEqual(resolve_processing_device("cuda", "cpu", cuda_available=True), "cuda")
+
+    def test_processing_device_warns_and_falls_back(self):
+        with self.assertWarns(RuntimeWarning):
+            self.assertEqual(resolve_processing_device("mps", "cpu", cuda_available=True), "cpu")
+        with self.assertWarns(RuntimeWarning):
+            self.assertEqual(resolve_processing_device("cuda", "cpu", cuda_available=False), "cpu")
 
     def test_artifact_debugging_is_strictly_opt_in(self):
         with patch.dict("os.environ", {}, clear=True):

@@ -7,6 +7,7 @@ or ComfyUI.
 
 from __future__ import annotations
 
+import warnings
 from typing import Iterator, Optional, Tuple, Union
 
 
@@ -33,3 +34,31 @@ def iter_frame_batches(length: int, batch_size: int) -> Iterator[Tuple[int, int]
     batch_size = resolve_decode_batch_size(batch_size)
     for start in range(0, length, batch_size):
         yield start, min(start + batch_size, length)
+
+
+def resolve_processing_device(
+    value: Optional[str], default: str, *, cuda_available: bool
+) -> str:
+    """Resolve an optional CPU/CUDA processing-device override safely."""
+
+    default = default.lower()
+    requested = value.strip().lower() if isinstance(value, str) else None
+    if requested is None or requested == "":
+        return default
+    if requested not in {"cpu", "cuda"}:
+        warnings.warn(
+            f"Invalid processing device {value!r}; expected 'cpu' or 'cuda'. "
+            f"Falling back to {default}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    if requested == "cuda" and not cuda_available:
+        warnings.warn(
+            f"CUDA processing was requested but CUDA is unavailable; "
+            f"falling back to {default}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    return requested

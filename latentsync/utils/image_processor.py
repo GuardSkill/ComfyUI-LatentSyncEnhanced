@@ -38,11 +38,17 @@ class ImageProcessor:
         device: str = "cpu",
         mask_image=None,
         restore_device: Optional[str] = None,
+        restore_dtype: Optional[torch.dtype] = None,
         detector_device: Optional[str] = None,
     ):
         self.resolution = resolution
         self.device = torch.device(device)
         self.restore_device = torch.device(restore_device or device)
+        self.restore_dtype = (
+            torch.float32
+            if self.restore_device.type == "cpu"
+            else (restore_dtype or torch.float16)
+        )
         self.detector_device = torch.device(detector_device or device)
         self.resize = transforms.Resize(
             (resolution, resolution), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
@@ -52,7 +58,7 @@ class ImageProcessor:
         self.restorer = AlignRestore(
             resolution=resolution,
             device=self.restore_device,
-            dtype=torch.float32 if self.restore_device.type == "cpu" else torch.float16,
+            dtype=self.restore_dtype,
         )
 
         if mask_image is None:

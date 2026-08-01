@@ -95,6 +95,11 @@ positive integer (for example `2`) when more VRAM is available. DeepCache is
 disabled automatically on GPUs with 16 GB or less; override this with
 `LATENTSYNC_ENABLE_DEEPCACHE=1`. `LATENTSYNC_MEMORY_FRACTION` is optional and
 only applies when explicitly set.
+For device-path diagnosis, set `LATENTSYNC_COMPOSITION_DEVICE` and/or
+`LATENTSYNC_RESTORE_DEVICE` to `cpu` or `cuda`. CPU uses float32; CUDA uses the
+loaded model's weight dtype. If unset, both preserve the normal low-VRAM CPU
+behavior. Invalid values (and CUDA when unavailable) warn and fall back to the
+normal default.
 
 ---
 
