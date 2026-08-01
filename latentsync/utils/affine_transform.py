@@ -6,6 +6,8 @@ import torch
 from einops import rearrange
 import kornia
 
+from .debug_artifacts import save_artifact_image
+
 
 class AlignRestore(object):
     def __init__(self, align_points=3, resolution=256, device="cpu", dtype=torch.float16):
@@ -17,18 +19,28 @@ class AlignRestore(object):
             self.face_template = self.face_template * ratio
             self.face_size = (int(75 * self.crop_ratio[0]), int(100 * self.crop_ratio[1]))
             self.p_bias = None
-            self.device = device
-            self.dtype = dtype
-            self.fill_value = torch.tensor([127, 127, 127], device=device, dtype=dtype)
-            self.mask = torch.ones((1, 1, self.face_size[1], self.face_size[0]), device=device, dtype=dtype)
+            self.device = torch.device(device)
+            # CPU float16 kernels are incomplete on some PyTorch builds.  The
+            # restoration path is intentionally CPU-friendly and uses fp32.
+            self.dtype = torch.float32 if self.device.type == "cpu" else dtype
+            self.fill_value = torch.tensor([127, 127, 127], device=self.device, dtype=self.dtype)
+            self.mask = torch.ones(
+                (1, 1, self.face_size[1], self.face_size[0]),
+                device=self.device,
+                dtype=self.dtype,
+            )
 
     def align_warp_face(self, img, landmarks3, smooth=True):
         affine_matrix, self.p_bias = self.transformation_from_points(
             landmarks3, self.face_template, smooth, self.p_bias
         )
 
-        img = rearrange(torch.from_numpy(img).to(device=self.device, dtype=self.dtype), "h w c -> c h w").unsqueeze(0)
-        affine_matrix = torch.from_numpy(affine_matrix).to(device=self.device, dtype=self.dtype).unsqueeze(0)
+        img = rearrange(
+            torch.from_numpy(img).to(device=self.device, dtype=self.dtype), "h w c -> c h w"
+        ).unsqueeze(0)
+        affine_matrix = torch.from_numpy(affine_matrix).to(
+            device=self.device, dtype=self.dtype
+        ).unsqueeze(0)
 
         cropped_face = kornia.geometry.transform.warp_affine(
             img,
@@ -39,31 +51,50 @@ class AlignRestore(object):
             fill_value=self.fill_value,
         )
         cropped_face = rearrange(cropped_face.squeeze(0), "c h w -> h w c").cpu().numpy().astype(np.uint8)
-        return cropped_face, affine_matrix
+        # Affine metadata is small and should not pin a CUDA allocation after
+        # preprocessing.  restore_img() moves it to its own device as needed.
+        return cropped_face, affine_matrix.detach().cpu()
 
-    def restore_img(self, input_img, face, affine_matrix):
+    def restore_img(self, input_img, face, affine_matrix, debug_frame_index=None):
         h, w, _ = input_img.shape
 
         if isinstance(affine_matrix, np.ndarray):
-            affine_matrix = torch.from_numpy(affine_matrix).to(device=self.device, dtype=self.dtype).unsqueeze(0)
+            affine_matrix = torch.from_numpy(affine_matrix)
+        affine_matrix = affine_matrix.to(device=self.device, dtype=self.dtype)
+        if affine_matrix.ndim == 2:
+            affine_matrix = affine_matrix.unsqueeze(0)
 
         inv_affine_matrix = kornia.geometry.transform.invert_affine_transform(affine_matrix)
-        face = face.to(dtype=self.dtype).unsqueeze(0)
+        face = face.to(device=self.device, dtype=self.dtype)
+        if face.ndim == 3:
+            face = face.unsqueeze(0)
 
         inv_face = kornia.geometry.transform.warp_affine(
             face, inv_affine_matrix, (h, w), mode="bilinear", padding_mode="fill", fill_value=self.fill_value
         ).squeeze(0)
         inv_face = (inv_face / 2 + 0.5).clamp(0, 1) * 255
+        if debug_frame_index is not None:
+            save_artifact_image(
+                "inverse_warped_face", debug_frame_index, inv_face, "zero_255"
+            )
 
-        input_img = rearrange(torch.from_numpy(input_img).to(device=self.device, dtype=self.dtype), "h w c -> c h w")
+        input_img = rearrange(
+            torch.from_numpy(input_img).to(device=self.device, dtype=self.dtype), "h w c -> c h w"
+        )
         inv_mask = kornia.geometry.transform.warp_affine(
             self.mask, inv_affine_matrix, (h, w), padding_mode="zeros"
         )  # (1, 1, h_up, w_up)
+        if debug_frame_index is not None:
+            save_artifact_image(
+                "inverse_mask", debug_frame_index, inv_mask, "zero_one"
+            )
 
         inv_mask_erosion = kornia.morphology.erosion(
             inv_mask,
             torch.ones(
-                (int(2 * self.upscale_factor), int(2 * self.upscale_factor)), device=self.device, dtype=self.dtype
+                (int(2 * self.upscale_factor), int(2 * self.upscale_factor)),
+                device=self.device,
+                dtype=self.dtype,
             ),
         )
 
@@ -81,7 +112,9 @@ class AlignRestore(object):
         # Run on CPU to avoid consuming a large amount of GPU memory.
         inv_mask_erosion = inv_mask_erosion.squeeze().cpu().numpy().astype(np.float32)
         inv_mask_center = cv2.erode(inv_mask_erosion, np.ones((erosion_radius, erosion_radius), np.uint8))
-        inv_mask_center = torch.from_numpy(inv_mask_center).to(device=self.device, dtype=self.dtype)[None, None, ...]
+        inv_mask_center = torch.from_numpy(inv_mask_center).to(
+            device=self.device, dtype=self.dtype
+        )[None, None, ...]
 
         blur_size = w_edge * 2 + 1
         sigma = 0.3 * ((blur_size - 1) * 0.5 - 1) + 0.8
@@ -93,18 +126,25 @@ class AlignRestore(object):
 
         img_back = rearrange(img_back, "c h w -> h w c").contiguous().to(dtype=torch.uint8)
         img_back = img_back.cpu().numpy()
+        if debug_frame_index is not None:
+            save_artifact_image(
+                "restored_frame", debug_frame_index, img_back, "zero_255"
+            )
         return img_back
 
     def transformation_from_points(self, points1: torch.Tensor, points0: torch.Tensor, smooth=True, p_bias=None):
         if isinstance(points0, np.ndarray):
             points2 = torch.tensor(points0, device=self.device, dtype=torch.float32)
         else:
-            points2 = points0.clone()
+            points2 = points0.to(device=self.device, dtype=torch.float32)
 
         if isinstance(points1, np.ndarray):
             points1_tensor = torch.tensor(points1, device=self.device, dtype=torch.float32)
         else:
-            points1_tensor = points1.clone()
+            points1_tensor = points1.to(device=self.device, dtype=torch.float32)
+
+        if p_bias is not None:
+            p_bias = p_bias.to(device=self.device, dtype=torch.float32)
 
         c1 = torch.mean(points1_tensor, dim=0)
         c2 = torch.mean(points2, dim=0)

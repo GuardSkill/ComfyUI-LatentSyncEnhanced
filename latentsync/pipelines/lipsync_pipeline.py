@@ -34,6 +34,7 @@ from ..models.unet import UNet3DConditionModel
 from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
+from ..utils.device_utils import iter_frame_batches, resolve_decode_batch_size
 import tqdm
 import soundfile as sf
 
@@ -140,10 +141,27 @@ class LipsyncPipeline(DiffusionPipeline):
         return self.device
 
     def decode_latents(self, latents):
-        latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
-        latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        decoded_latents = self.vae.decode(latents).sample
-        return decoded_latents
+        return torch.cat(list(self.decode_latents_stream(latents)), dim=0)
+
+    def decode_latents_stream(
+        self,
+        latents: torch.Tensor,
+        decode_batch_size: int = 1,
+        output_device: Optional[Union[str, torch.device]] = None,
+    ):
+        """Decode temporal latents in bounded batches for low-VRAM processing."""
+        decode_batch_size = resolve_decode_batch_size(decode_batch_size)
+        scale = self.vae.config.scaling_factor
+        shift = self.vae.config.shift_factor
+        scaled_latents = latents / scale + shift
+        flat_latents = rearrange(scaled_latents, "b c f h w -> (b f) c h w")
+        target_device = torch.device(output_device) if output_device is not None else None
+        for start, end in iter_frame_batches(flat_latents.shape[0], decode_batch_size):
+            decoded = self.vae.decode(flat_latents[start:end]).sample
+            if target_device is not None:
+                decoded = decoded.to(device=target_device)
+            yield decoded
+            del decoded
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -193,42 +211,61 @@ class LipsyncPipeline(DiffusionPipeline):
         return latents
 
     def prepare_mask_latents(
-        self, mask, masked_image, height, width, dtype, device, generator, do_classifier_free_guidance
+        self,
+        conditioning_mask,
+        masked_image,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        do_classifier_free_guidance,
+        *,
+        mask_role="conditioning",
     ):
-        # resize the mask to latents shape as we concatenate the mask to the latents
-        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
-        # and half precision
-        mask = torch.nn.functional.interpolate(
-            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        """Prepare the unchanged canonical LatentSync conditioning tensors."""
+        if mask_role != "conditioning":
+            raise RuntimeError(
+                "composition_editable_mask must never be passed to prepare_mask_latents()"
+            )
+        if conditioning_mask.ndim != 4 or conditioning_mask.shape[1] != 1:
+            raise ValueError(f"conditioning_mask must be [F,1,H,W], got {tuple(conditioning_mask.shape)}")
+        if masked_image.ndim != 4 or masked_image.shape[1] != 3:
+            raise ValueError(f"masked image pixels must be [F,3,H,W], got {tuple(masked_image.shape)}")
+        if not torch.isfinite(conditioning_mask).all() or not torch.all((conditioning_mask >= 0) & (conditioning_mask <= 1)):
+            raise ValueError("conditioning_mask must be finite and within [0, 1]")
+        canonical_source = getattr(getattr(self, "image_processor", None), "mask_image", None)
+        if canonical_source is not None:
+            expected = canonical_source.to(device=conditioning_mask.device, dtype=conditioning_mask.dtype)
+            if expected.ndim == 3:
+                expected = expected.unsqueeze(0)
+            expected = expected.expand_as(conditioning_mask)
+            if not torch.equal(conditioning_mask, expected):
+                raise AssertionError("conditioning_mask does not match the original canonical LatentSync mask")
+        conditioning_mask = torch.nn.functional.interpolate(
+            conditioning_mask,
+            size=(height // self.vae_scale_factor, width // self.vae_scale_factor),
         )
+        device = torch.device(device)
         masked_image = masked_image.to(device=device, dtype=dtype)
-
-        # encode the mask image into latents space so we can concatenate it to the latents
         masked_image_latents = self.vae.encode(masked_image).latent_dist.sample(generator=generator)
         masked_image_latents = (masked_image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-
-        # aligning device to prevent device errors when concating it with the latent model input
         masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
-        mask = mask.to(device=device, dtype=dtype)
-
-        # assume batch size = 1
-        mask = rearrange(mask, "f c h w -> 1 c f h w")
+        conditioning_mask = conditioning_mask.to(device=device, dtype=dtype)
+        conditioning_mask = rearrange(conditioning_mask, "f c h w -> 1 c f h w")
         masked_image_latents = rearrange(masked_image_latents, "f c h w -> 1 c f h w")
-
-        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
-        masked_image_latents = (
-            torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
-        )
-        return mask, masked_image_latents
+        if do_classifier_free_guidance:
+            conditioning_mask = torch.cat([conditioning_mask] * 2)
+            masked_image_latents = torch.cat([masked_image_latents] * 2)
+        return conditioning_mask, masked_image_latents
 
     def prepare_image_latents(self, images, device, dtype, generator, do_classifier_free_guidance):
+        device = torch.device(device)
         images = images.to(device=device, dtype=dtype)
         image_latents = self.vae.encode(images).latent_dist.sample(generator=generator)
         image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
         image_latents = rearrange(image_latents, "f c h w -> 1 c f h w")
-        image_latents = torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
-
-        return image_latents
+        return torch.cat([image_latents] * 2) if do_classifier_free_guidance else image_latents
 
     def set_progress_bar_config(self, **kwargs):
         if not hasattr(self, "_progress_bar_config"):
@@ -236,12 +273,33 @@ class LipsyncPipeline(DiffusionPipeline):
         self._progress_bar_config.update(kwargs)
 
     @staticmethod
-    def paste_surrounding_pixels_back(decoded_latents, pixel_values, masks, device, weight_dtype):
-        # Paste the surrounding pixels back, because we only want to change the mouth region
-        pixel_values = pixel_values.to(device=device, dtype=weight_dtype)
-        masks = masks.to(device=device, dtype=weight_dtype)
-        combined_pixel_values = decoded_latents * masks + pixel_values * (1 - masks)
-        return combined_pixel_values
+    def compose_decoded_face(decoded_face, reference_face, composition_editable_mask):
+        """Composite decoded pixels only where the post-decode mask is editable."""
+        if decoded_face.shape != reference_face.shape:
+            raise ValueError("decoded_face and reference_face must have identical shapes")
+        if composition_editable_mask.ndim != 4 or composition_editable_mask.shape[1] != 1:
+            raise ValueError("composition_editable_mask must be [F,1,H,W]")
+        if not torch.isfinite(composition_editable_mask).all() or not torch.all(
+            (composition_editable_mask >= 0) & (composition_editable_mask <= 1)
+        ):
+            raise ValueError("composition_editable_mask must be finite and within [0, 1]")
+        return decoded_face * composition_editable_mask + reference_face * (1.0 - composition_editable_mask)
+
+    @staticmethod
+    def paste_surrounding_pixels_back(
+        decoded_face,
+        reference_face,
+        composition_editable_mask,
+        device,
+        weight_dtype,
+    ):
+        device = torch.device(device)
+        decoded_face = decoded_face.to(device=device, dtype=weight_dtype)
+        reference_face = reference_face.to(device=device, dtype=weight_dtype)
+        composition_editable_mask = composition_editable_mask.to(device=device, dtype=weight_dtype)
+        return LipsyncPipeline.compose_decoded_face(
+            decoded_face, reference_face, composition_editable_mask
+        )
 
     @staticmethod
     def pixel_values_to_images(pixel_values: torch.Tensor):
@@ -400,13 +458,14 @@ class LipsyncPipeline(DiffusionPipeline):
                 audio_embeds = None
             inference_faces = faces[i * num_frames : (i + 1) * num_frames]
             latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
-            ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+            ref_pixel_values, masked_pixel_values, conditioning_mask = self.image_processor.prepare_masks_and_masked_images(
                 inference_faces, affine_transform=False
             )
+            composition_editable_mask = (1.0 - conditioning_mask).clamp(0.0, 1.0)
 
             # 7. Prepare mask latent variables
-            mask_latents, masked_image_latents = self.prepare_mask_latents(
-                masks,
+            conditioning_mask_latents, conditioning_masked_image_latents = self.prepare_mask_latents(
+                conditioning_mask,
                 masked_pixel_values,
                 height,
                 width,
@@ -436,7 +495,12 @@ class LipsyncPipeline(DiffusionPipeline):
 
                     # concat latents, mask, masked_image_latents in the channel dimension
                     unet_input = torch.cat(
-                        [unet_input, mask_latents, masked_image_latents, ref_latents], dim=1
+                        [
+                            unet_input,
+                            conditioning_mask_latents,
+                            conditioning_masked_image_latents,
+                            ref_latents,
+                        ],
                     )
 
                     # predict the noise residual
@@ -461,7 +525,11 @@ class LipsyncPipeline(DiffusionPipeline):
             # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
             decoded_latents = self.paste_surrounding_pixels_back(
-                decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
+                decoded_latents,
+                ref_pixel_values,
+                composition_editable_mask,
+                device,
+                weight_dtype,
             )
             synced_video_frames.append(decoded_latents)
 

@@ -8,3 +8,4 @@ omegaconf
 einops
 diffusers>=0.24.0
 accelerate
+imageio

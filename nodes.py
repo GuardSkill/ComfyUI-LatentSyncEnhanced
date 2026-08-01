@@ -27,6 +27,8 @@ from einops import rearrange
 
 import folder_paths
 
+
+
 # ---------------------------------------------------------------------------
 # Make this node's own latentsync package importable (self-contained)
 # ---------------------------------------------------------------------------
@@ -37,11 +39,39 @@ if _NODE_DIR not in sys.path:
 
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from latentsync.utils.image_processor import ImageProcessor, load_fixed_mask
-from latentsync.utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
+from latentsync.utils.util import (
+    read_video,
+    read_video_file,
+    read_audio,
+    write_video,
+    check_ffmpeg_installed,
+)
+from latentsync.utils.device_utils import (
+    iter_frame_batches,
+    resolve_decode_batch_size,
+    resolve_processing_device,
+)
+from latentsync.utils.debug_artifacts import artifact_debug_enabled, save_artifact_image
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.whisper.audio2feature import Audio2Feature
 from diffusers import AutoencoderKL, DDIMScheduler
 from accelerate.utils import set_seed
+
+
+def _build_masked_pixel_values(reference_pixel_values, conditioning_mask, *, role):
+    """Construct masked-image pixels from the canonical conditioning mask."""
+    del role
+    assert reference_pixel_values is not None
+    assert conditioning_mask is not None
+    assert reference_pixel_values.ndim == 4
+    assert conditioning_mask.ndim == 4
+    assert reference_pixel_values.shape[0] == conditioning_mask.shape[0]
+    assert conditioning_mask.shape[1] == 1
+    masked_pixel_values = reference_pixel_values * conditioning_mask
+    assert masked_pixel_values is not None
+    assert masked_pixel_values.shape == reference_pixel_values.shape
+    assert torch.isfinite(masked_pixel_values).all()
+    return masked_pixel_values
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +108,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     # Face detection helpers
     # ------------------------------------------------------------------
 
-    def _safe_affine_transform_segment(self, video_frames):
+    def _safe_affine_transform_segment(self, video_frames, frame_offset=0):
         """
         Run face detection + affine alignment on a segment.
 
@@ -91,20 +121,31 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         no_face_set : set[int]
             Indices (within this segment) of frames where no face was found.
         """
-        faces, boxes, matrices = [], [], []
+        faces, boxes, matrices, yaws, original_landmarks, aligned_landmarks = [], [], [], [], [], []
         no_face_indices = []
 
         for i, frame in enumerate(tqdm.tqdm(video_frames, desc="Face detection", leave=False)):
+            frame_index = frame_offset + i
+            save_artifact_image("original_frame", frame_index, frame, "zero_255")
             try:
-                face, box, matrix = self.image_processor.affine_transform(frame)
+                face, box, matrix, yaw, detector_landmarks, landmarks = self.image_processor.affine_transform(
+                    frame, return_mask_geometry=True, frame_index=frame_index
+                )
+                save_artifact_image("aligned_face", frame_index, face, "zero_255")
                 faces.append(face)
                 boxes.append(box)
                 matrices.append(matrix)
+                yaws.append(yaw)
+                original_landmarks.append(detector_landmarks)
+                aligned_landmarks.append(landmarks)
             except RuntimeError as e:
                 if "Face not detected" in str(e):
                     faces.append(None)
                     boxes.append(None)
                     matrices.append(None)
+                    yaws.append(None)
+                    original_landmarks.append(None)
+                    aligned_landmarks.append(None)
                     no_face_indices.append(i)
                 else:
                     raise
@@ -126,7 +167,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 "[LatentSyncEnhanced] WARNING: No faces detected in this segment. "
                 "Passing through original frames unchanged (no lip-sync applied)."
             )
-            return None, None, None, no_face_set
+            return None, None, None, None, None, None, no_face_set
 
         # Fill no-face slots with data from the nearest frame that has a face
         # (only used as diffusion input; output will still be the original frame)
@@ -135,22 +176,40 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             faces[idx] = faces[nearest]
             boxes[idx] = boxes[nearest]
             matrices[idx] = matrices[nearest]
-
-        return torch.stack(faces), boxes, matrices, no_face_set
+            yaws[idx] = yaws[nearest]
+            original_landmarks[idx] = original_landmarks[nearest]
+            aligned_landmarks[idx] = aligned_landmarks[nearest]
+            save_artifact_image(
+                "aligned_face", frame_offset + idx, faces[idx], "zero_255"
+            )
+        return torch.stack(faces), boxes, matrices, yaws, original_landmarks, aligned_landmarks, no_face_set
 
     # ------------------------------------------------------------------
     # Restoration helper
     # ------------------------------------------------------------------
 
-    def _restore_segment(self, synced_faces, original_frames, boxes, matrices, no_face_set):
+    def _restore_segment(
+        self, synced_faces, original_frames, boxes, matrices, no_face_set, frame_offset=0
+    ):
         """
         Paste synced faces back into original_frames.
         Frames whose index is in no_face_set are returned unchanged.
         """
         out_frames = []
         for i, face in enumerate(tqdm.tqdm(synced_faces, desc="Restoring", leave=False)):
+            frame_index = frame_offset + i
             if i in no_face_set:
                 out_frames.append(original_frames[i])
+                if artifact_debug_enabled():
+                    save_artifact_image(
+                        "inverse_mask",
+                        frame_index,
+                        np.zeros(original_frames[i].shape[:2], dtype=np.uint8),
+                        "zero_255",
+                    )
+                    save_artifact_image(
+                        "restored_frame", frame_index, original_frames[i], "zero_255"
+                    )
                 continue
             x1, y1, x2, y2 = boxes[i]
             h = int(y2 - y1)
@@ -160,8 +219,11 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 interpolation=transforms.InterpolationMode.BICUBIC,
                 antialias=True,
             )
+            save_artifact_image(
+                "face_before_restore", frame_index, face, "minus_one_one"
+            )
             out_frame = self.image_processor.restorer.restore_img(
-                original_frames[i], face, matrices[i]
+                original_frames[i], face, matrices[i], debug_frame_index=frame_index
             )
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
@@ -185,6 +247,102 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     # Main __call__ — segment-based, OOM-safe
     # ------------------------------------------------------------------
 
+    def _prepare_node_inference_masks(
+        self, inference_faces, *, segment_index, window_start, segment_start,
+        yaws, original_landmarks, aligned_landmarks,
+    ):
+        """Build canonical conditioning and post-decode composition masks."""
+        del segment_index
+        frame_indices = [segment_start + window_start + n for n in range(len(inference_faces))]
+        metadata = {
+            "frame_indices": frame_indices,
+            "yaw_values": yaws,
+            "original_landmarks": original_landmarks,
+            "aligned_landmarks": aligned_landmarks,
+        }
+        lengths = {key: None if value is None else len(value) for key, value in metadata.items()}
+        if any(value is None for value in metadata.values()) or any(
+            length != len(inference_faces) for length in lengths.values()
+        ):
+            raise RuntimeError(f"Missing or misaligned production metadata: lengths={lengths}")
+        for frame_index, yaw, original, aligned in zip(
+            frame_indices, yaws, original_landmarks, aligned_landmarks
+        ):
+            if yaw is None or not np.isfinite(yaw):
+                raise RuntimeError(f"Invalid signed yaw for frame {frame_index}")
+            original = np.asarray(original)
+            aligned = np.asarray(aligned)
+            if original.shape != (106, 2) or not np.isfinite(original).all():
+                raise RuntimeError(f"Invalid detector-space landmarks for frame {frame_index}")
+            if aligned.shape != (106, 2) or not np.isfinite(aligned).all():
+                raise RuntimeError(f"Invalid aligned landmarks for frame {frame_index}")
+        mask_batch = self.image_processor.prepare_dual_masks_and_masked_images(
+            inference_faces,
+            affine_transform=False,
+            yaws=yaws,
+            aligned_landmarks=aligned_landmarks,
+            frame_offset=segment_start + window_start,
+            original_landmarks=original_landmarks,
+            metadata_required=True,
+        )
+        ref_pv = mask_batch.reference_pixel_values
+        conditioning_mask = mask_batch.conditioning_mask
+        masked_pv_canonical = _build_masked_pixel_values(
+            ref_pv, conditioning_mask, role="canonical"
+        )
+        assert masked_pv_canonical is not None
+        assert masked_pv_canonical.shape == ref_pv.shape
+        assert torch.isfinite(masked_pv_canonical).all()
+        canonical_source = self.image_processor.mask_image.to(
+            device=conditioning_mask.device, dtype=conditioning_mask.dtype
+        )
+        if canonical_source.ndim == 3:
+            canonical_source = canonical_source.unsqueeze(0)
+        if not torch.equal(conditioning_mask, canonical_source.expand_as(conditioning_mask)):
+            raise RuntimeError("conditioning_mask deviated from the original canonical LatentSync mask")
+        if not torch.allclose(masked_pv_canonical, mask_batch.masked_reference_pixel_values, atol=1e-4, rtol=0.0):
+            raise RuntimeError("masked_reference_pixel_values were not built from conditioning_mask")
+        return mask_batch
+
+    @torch.no_grad()
+    def _denoise_window(
+        self,
+        latents,
+        conditioning_mask_latents,
+        conditioning_masked_image_latents,
+        reference_latents,
+        audio_embeds,
+        timesteps,
+        num_inference_steps,
+        guidance_scale,
+        extra_step_kwargs,
+        callback=None,
+        callback_steps=1,
+    ):
+        """Run the unchanged denoising equations for one canonical condition."""
+        do_cfg = guidance_scale > 1.0
+        num_warmup = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as pbar:
+            for j, timestep in enumerate(timesteps):
+                unet_in = torch.cat([latents] * 2) if do_cfg else latents
+                unet_in = self.scheduler.scale_model_input(unet_in, timestep)
+                unet_in = torch.cat(
+                    [unet_in, conditioning_mask_latents, conditioning_masked_image_latents, reference_latents],
+                    dim=1,
+                )
+                noise_pred = self.unet(unet_in, timestep, encoder_hidden_states=audio_embeds).sample
+                if do_cfg:
+                    noise_uncond, noise_audio = noise_pred.chunk(2)
+                    noise_pred = noise_uncond + guidance_scale * (noise_audio - noise_uncond)
+                latents = self.scheduler.step(noise_pred, timestep, latents, **extra_step_kwargs).prev_sample
+                if j == len(timesteps) - 1 or (
+                    (j + 1) > num_warmup and (j + 1) % self.scheduler.order == 0
+                ):
+                    pbar.update()
+                    if callback is not None and j % callback_steps == 0:
+                        callback(j, timestep, latents)
+        return latents
+
     @torch.no_grad()
     def __call__(
         self,
@@ -206,21 +364,59 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         callback=None,
         callback_steps=1,
         chunk_frames: int = 80,
+        decode_batch_size: int = 1,
+        cpu_offload: bool = True,
         **kwargs,
     ):
         is_train = self.unet.training
         self.unet.eval()
-
         check_ffmpeg_installed()
-
-        device = self._execution_device
-        mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
-        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width  = width  or self.unet.config.sample_size * self.vae_scale_factor
         self.check_inputs(height, width, callback_steps)
+
+        device = self._execution_device
+        decode_batch_size = resolve_decode_batch_size(decode_batch_size)
+        default_aux_device = "cpu" if cpu_offload else device.type
+        composition_device = torch.device(resolve_processing_device(
+            os.getenv("LATENTSYNC_COMPOSITION_DEVICE"),
+            default_aux_device,
+            cuda_available=torch.cuda.is_available(),
+        ))
+        restore_device = torch.device(resolve_processing_device(
+            os.getenv("LATENTSYNC_RESTORE_DEVICE"),
+            default_aux_device,
+            cuda_available=torch.cuda.is_available(),
+        ))
+        composition_dtype = (
+            torch.float32 if composition_device.type == "cpu" else weight_dtype
+        )
+        restore_dtype = torch.float32 if restore_device.type == "cpu" else weight_dtype
+        mask_image = load_fixed_mask(height, mask_image_path)
+        self.image_processor = ImageProcessor(
+            height,
+            device=str(device),
+            mask_image=mask_image,
+            # Keep geometric restoration off CUDA when decoded faces are
+            # streamed to CPU.  The detector may still use CUDA.
+            restore_device=str(restore_device),
+            restore_dtype=restore_dtype,
+            detector_device=str(device),
+        )
+        print(
+            "[LatentSyncEnhanced] Device policy: "
+            f"diffusion={device}, decode_batch_size={decode_batch_size}"
+        )
+        print(
+            "[LatentSyncEnhanced] "
+            f"composition device/dtype: {composition_device}/{composition_dtype}"
+        )
+        print(
+            "[LatentSyncEnhanced] "
+            f"restoration device/dtype: {restore_device}/{restore_dtype}"
+        )
+        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         do_cfg = guidance_scale > 1.0
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -232,6 +428,13 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         whisper_chunks  = self.audio_encoder.feature2chunks(
             feature_array=whisper_feature, fps=video_fps
         )
+        # Whisper is only needed while creating CPU audio chunks.  Releasing it
+        # before diffusion makes the CUDA residency contract explicit.
+        if cpu_offload and hasattr(self.audio_encoder, "model"):
+            self.audio_encoder.model.to("cpu")
+            print("[LatentSyncEnhanced] Offloaded Whisper encoder to CPU after feature extraction.")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         audio_samples = read_audio(audio_path)
 
         # Use actual audio duration (samples) as ground truth for target frame count.
@@ -241,7 +444,9 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         whisper_chunks = whisper_chunks[:actual_audio_frames]
 
         # ── Video (loop to match audio, no face detection yet) ──────────
-        video_frames = read_video(video_path, use_decord=False)
+        # The node already encoded the input at video_fps.  Do not silently
+        # transcode it back to the legacy 25 FPS default in read_video().
+        video_frames = read_video(video_path, change_fps=False, use_decord=False)
         video_frames = self._loop_frames_only(video_frames, actual_audio_frames)
 
         total_frames = len(video_frames)
@@ -261,13 +466,14 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 f"({seg_end - seg_start} frames)..."
             )
 
-            seg_faces, seg_boxes, seg_matrices, no_face_set = \
-                self._safe_affine_transform_segment(seg_video)
+            seg_faces, seg_boxes, seg_matrices, seg_yaws, seg_original_landmarks, seg_landmarks, no_face_set = \
+                self._safe_affine_transform_segment(seg_video, frame_offset=seg_start)
 
             if seg_faces is None:
                 # Every frame in this segment has no face → pass through unchanged
                 all_synced_frames.append(seg_video.copy())
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
 
             # Allocate latents ONLY for this segment (avoids O(total_frames) allocation)
@@ -292,61 +498,167 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                     audio_embeds = None
 
                 inference_faces = seg_faces[i * num_frames : (i + 1) * num_frames]
+                inference_yaws = seg_yaws[i * num_frames : (i + 1) * num_frames]
+                inference_landmarks = seg_landmarks[i * num_frames : (i + 1) * num_frames]
+                inference_original_landmarks = seg_original_landmarks[i * num_frames : (i + 1) * num_frames]
                 latents         = seg_latents[:, :, i * num_frames : (i + 1) * num_frames]
 
-                ref_pv, masked_pv, masks = self.image_processor.prepare_masks_and_masked_images(
-                    inference_faces, affine_transform=False
+                window_start = i * num_frames
+                mask_batch = self._prepare_node_inference_masks(
+                    inference_faces,
+                    segment_index=seg_start // chunk_frames,
+                    window_start=window_start,
+                    segment_start=seg_start,
+                    yaws=inference_yaws,
+                    original_landmarks=inference_original_landmarks,
+                    aligned_landmarks=inference_landmarks,
                 )
-                mask_latents, masked_img_latents = self.prepare_mask_latents(
-                    masks, masked_pv, height, width, weight_dtype, device, generator, do_cfg
+                ref_pv = mask_batch.reference_pixel_values
+                conditioning_mask = mask_batch.conditioning_mask
+                composition_editable_mask = mask_batch.composition_editable_mask
+                masked_pv_canonical = _build_masked_pixel_values(
+                    ref_pv,
+                    conditioning_mask,
+                    role="canonical",
+                )
+                assert masked_pv_canonical is not None
+                assert masked_pv_canonical.shape == ref_pv.shape
+                assert torch.isfinite(masked_pv_canonical).all()
+                if not torch.allclose(
+                    masked_pv_canonical,
+                    mask_batch.masked_reference_pixel_values,
+                    atol=1e-4,
+                    rtol=0.0,
+                ):
+                    raise RuntimeError(
+                        "canonical masked pixel values diverged from ImageProcessor output"
+                    )
+                assert masked_pv_canonical is not None
+                assert masked_pv_canonical.shape == ref_pv.shape
+                assert torch.isfinite(masked_pv_canonical).all()
+                conditioning_mask_latents, conditioning_masked_image_latents = self.prepare_mask_latents(
+                    conditioning_mask,
+                    masked_pv_canonical,
+                    height,
+                    width,
+                    weight_dtype,
+                    device,
+                    generator,
+                    do_cfg,
+                    mask_role="conditioning",
                 )
                 ref_latents = self.prepare_image_latents(
                     ref_pv, device, weight_dtype, generator, do_cfg
                 )
 
-                # Denoising loop
-                num_warmup = len(timesteps) - num_inference_steps * self.scheduler.order
-                with self.progress_bar(total=num_inference_steps) as pbar:
-                    for j, t in enumerate(timesteps):
-                        unet_in = torch.cat([latents] * 2) if do_cfg else latents
-                        unet_in = self.scheduler.scale_model_input(unet_in, t)
-                        unet_in = torch.cat(
-                            [unet_in, mask_latents, masked_img_latents, ref_latents], dim=1
-                        )
-                        noise_pred = self.unet(
-                            unet_in, t, encoder_hidden_states=audio_embeds
-                        ).sample
-                        if do_cfg:
-                            noise_uncond, noise_audio = noise_pred.chunk(2)
-                            noise_pred = noise_uncond + guidance_scale * (noise_audio - noise_uncond)
-                        latents = self.scheduler.step(
-                            noise_pred, t, latents, **extra_step_kwargs
-                        ).prev_sample
-                        if j == len(timesteps) - 1 or (
-                            (j + 1) > num_warmup and (j + 1) % self.scheduler.order == 0
-                        ):
-                            pbar.update()
-                            if callback is not None and j % callback_steps == 0:
-                                callback(j, t, latents)
-
-                decoded = self.decode_latents(latents)
-                decoded = self.paste_surrounding_pixels_back(
-                    decoded, ref_pv, 1 - masks, device, weight_dtype
+                latents = self._denoise_window(
+                    latents,
+                    conditioning_mask_latents,
+                    conditioning_masked_image_latents,
+                    ref_latents,
+                    audio_embeds,
+                    timesteps,
+                    num_inference_steps,
+                    guidance_scale,
+                    extra_step_kwargs,
+                    callback=callback,
+                    callback_steps=callback_steps,
                 )
-                synced_chunk.append(decoded)
 
-                # Free per-batch GPU tensors immediately
-                del ref_pv, masked_pv, masks, mask_latents, masked_img_latents, ref_latents
+                # The UNet no longer needs its conditioning tensors.  Delete
+                # them before entering VAE decode so their allocations cannot
+                # overlap the decoder's peak activation memory.
+                assert masked_pv_canonical is not None
+                assert masked_pv_canonical.shape == ref_pv.shape
+                assert torch.isfinite(masked_pv_canonical).all()
+                del (
+                    masked_pv_canonical,
+                    conditioning_mask_latents,
+                    conditioning_masked_image_latents,
+                    ref_latents,
+                )
+                if audio_embeds is not None:
+                    del audio_embeds
+                if "unet_in" in locals():
+                    del unet_in
+                if "noise_pred" in locals():
+                    del noise_pred
+                if "noise_uncond" in locals():
+                    del noise_uncond
+                if "noise_audio" in locals():
+                    del noise_audio
+                if "null" in locals():
+                    del null
+
+                # Decode and restore one bounded batch at a time.  In CPU
+                # offload mode every operation after VAE.decode is explicitly
+                # CPU-owned, so no CUDA tensor is retained by synced_chunk.
+                for decode_start, decode_end in iter_frame_batches(
+                    latents.shape[2], decode_batch_size
+                ):
+                    decoded = next(
+                        self.decode_latents_stream(
+                            latents[:, :, decode_start:decode_end],
+                            decode_batch_size=decode_batch_size,
+                            output_device=composition_device,
+                        )
+                    )
+                    decoded = decoded.to(device=composition_device, dtype=composition_dtype)
+                    ref_slice = ref_pv[decode_start:decode_end]
+                    composition_slice = composition_editable_mask[decode_start:decode_end]
+                    if artifact_debug_enabled():
+                        for batch_index in range(decoded.shape[0]):
+                            frame_index = window_start + decode_start + batch_index
+                            frame_index += seg_start
+                            save_artifact_image(
+                                "decoded_face",
+                                frame_index,
+                                decoded[batch_index],
+                                "minus_one_one",
+                            )
+                    composed = self.paste_surrounding_pixels_back(
+                        decoded,
+                        ref_slice,
+                        composition_slice,
+                        composition_device,
+                        composition_dtype,
+                    )
+                    composed = composed.to(device=restore_device, dtype=restore_dtype)
+
+                    local_no_face_set = {
+                        index - decode_start
+                        for index in no_face_set
+                        if decode_start <= index < decode_end
+                    }
+                    restored = self._restore_segment(
+                        composed,
+                        seg_video[window_start + decode_start : window_start + decode_end],
+                        seg_boxes[window_start + decode_start : window_start + decode_end],
+                        seg_matrices[window_start + decode_start : window_start + decode_end],
+                        local_no_face_set,
+                        frame_offset=seg_start + window_start + decode_start,
+                    )
+                    synced_chunk.append(restored)
+                    del decoded, ref_slice, composition_slice, composed, restored
+
+                # ref_pv and the two independent mask tensors are CPU storage
+                # needed only for this
+                # window; release their references before the next window.
+                del (
+                    ref_pv,
+                    conditioning_mask,
+                    composition_editable_mask,
+                    mask_batch,
+                    latents,
+                )
 
             # Restore faces → numpy output for this segment
-            seg_out = self._restore_segment(
-                torch.cat(synced_chunk), seg_video, seg_boxes, seg_matrices, no_face_set
-            )
-            all_synced_frames.append(seg_out)
+            all_synced_frames.append(np.concatenate(synced_chunk, axis=0))
 
             # Aggressively free segment allocations
-            del seg_faces, seg_boxes, seg_matrices, seg_latents, synced_chunk
-            torch.cuda.empty_cache()
+            del seg_faces, seg_boxes, seg_matrices, seg_yaws, seg_original_landmarks, seg_landmarks, seg_latents, synced_chunk
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # ── Assemble and write output ────────────────────────────────────
         synced_video_frames = np.concatenate(all_synced_frames, axis=0)
@@ -487,15 +799,27 @@ class LatentSyncEnhancedNode:
             scheduler=scheduler,
         ).to("cuda")
 
-        # DeepCache (optional speed-up)
-        try:
-            from DeepCache import DeepCacheSDHelper
-            helper = DeepCacheSDHelper(pipe=pipeline)
-            helper.set_params(cache_interval=3, cache_branch_id=0)
-            helper.enable()
-            print("[LatentSyncEnhanced] DeepCache enabled.")
-        except ImportError:
-            print("[LatentSyncEnhanced] DeepCache not available, skipping.")
+        # DeepCache retains UNet activations.  Keep it for larger cards, but
+        # disable it automatically on low-VRAM GPUs unless explicitly forced.
+        deepcache_setting = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "auto").lower()
+        low_vram = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(0).total_memory / (1024 ** 3) <= 16
+        )
+        enable_deepcache = deepcache_setting == "1" or (
+            deepcache_setting == "auto" and not low_vram
+        )
+        if enable_deepcache:
+            try:
+                from DeepCache import DeepCacheSDHelper
+                helper = DeepCacheSDHelper(pipe=pipeline)
+                helper.set_params(cache_interval=3, cache_branch_id=0)
+                helper.enable()
+                print("[LatentSyncEnhanced] DeepCache enabled.")
+            except ImportError:
+                print("[LatentSyncEnhanced] DeepCache not available, skipping.")
+        else:
+            print("[LatentSyncEnhanced] DeepCache disabled by low-VRAM policy.")
 
         return pipeline
 
@@ -513,7 +837,13 @@ class LatentSyncEnhancedNode:
                 torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
             torch.cuda.empty_cache()
-            torch.cuda.set_per_process_memory_fraction(0.8)
+            memory_fraction = os.getenv("LATENTSYNC_MEMORY_FRACTION")
+            if memory_fraction:
+                torch.cuda.set_per_process_memory_fraction(float(memory_fraction))
+                print(
+                    "[LatentSyncEnhanced] CUDA allocator fraction set to "
+                    f"{memory_fraction} by LATENTSYNC_MEMORY_FRACTION."
+                )
 
         weight_dtype = torch.float16 if use_fp16 else torch.float32
 
@@ -534,12 +864,9 @@ class LatentSyncEnhancedNode:
                 frames = images
             frames_uint8 = (frames.cpu() * 255).to(torch.uint8)
 
-            try:
-                import torchvision.io as tio
-                tio.write_video(temp_video_path, frames_uint8, fps=video_fps, video_codec="h264")
-            except Exception:
-                import imageio
-                imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=video_fps, macro_block_size=1)
+            # ImageIO is the maintained video I/O boundary.  TorchVision's
+            # encode_video/read_video APIs are deprecated and version-sensitive.
+            write_video(temp_video_path, frames_uint8.numpy(), fps=video_fps)
 
             # ── Prepare input audio ─────────────────────────────────────
             waveform    = audio["waveform"]
@@ -591,6 +918,12 @@ class LatentSyncEnhancedNode:
                 mask_image_path=mask_image_path,
                 chunk_frames=chunk_frames,
                 video_fps=video_fps,
+                # Keep the ComfyUI node inputs unchanged.  Advanced users can
+                # tune this internal bound with LATENTSYNC_DECODE_BATCH_SIZE.
+                decode_batch_size=resolve_decode_batch_size(
+                    os.getenv("LATENTSYNC_DECODE_BATCH_SIZE", "1")
+                ),
+                cpu_offload=True,
             )
 
             if torch.cuda.is_available():
@@ -600,9 +933,8 @@ class LatentSyncEnhancedNode:
                 raise FileNotFoundError(f"Output video not found: {output_video_path}")
 
             # ── Read result ─────────────────────────────────────────────
-            import torchvision.io as tio
-            processed_frames = tio.read_video(output_video_path, pts_unit="sec")[0]
-            processed_frames = processed_frames.float() / 255.0
+            processed_frames = read_video_file(output_video_path)
+            processed_frames = torch.from_numpy(processed_frames).float() / 255.0
 
             return (processed_frames.cpu(), resampled_audio)
 
