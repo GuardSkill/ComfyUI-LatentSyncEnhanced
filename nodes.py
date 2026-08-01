@@ -37,7 +37,14 @@ if _NODE_DIR not in sys.path:
 
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from latentsync.utils.image_processor import ImageProcessor, load_fixed_mask
-from latentsync.utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
+from latentsync.utils.util import (
+    read_video,
+    read_video_file,
+    read_audio,
+    write_video,
+    check_ffmpeg_installed,
+)
+from latentsync.utils.device_utils import iter_frame_batches, resolve_decode_batch_size
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.whisper.audio2feature import Audio2Feature
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -206,6 +213,8 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         callback=None,
         callback_steps=1,
         chunk_frames: int = 80,
+        decode_batch_size: int = 1,
+        cpu_offload: bool = True,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -213,14 +222,30 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
 
         check_ffmpeg_installed()
 
-        device = self._execution_device
-        mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
-        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
-
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width  = width  or self.unet.config.sample_size * self.vae_scale_factor
         self.check_inputs(height, width, callback_steps)
+
+        device = self._execution_device
+        decode_batch_size = resolve_decode_batch_size(decode_batch_size)
+        composition_device = torch.device("cpu") if cpu_offload else device
+        composition_dtype = torch.float32 if cpu_offload else weight_dtype
+        mask_image = load_fixed_mask(height, mask_image_path)
+        self.image_processor = ImageProcessor(
+            height,
+            device=str(device),
+            mask_image=mask_image,
+            # Keep geometric restoration off CUDA when decoded faces are
+            # streamed to CPU.  The detector may still use CUDA.
+            restore_device="cpu" if cpu_offload else str(device),
+            detector_device=str(device),
+        )
+        print(
+            "[LatentSyncEnhanced] Device policy: "
+            f"diffusion={device}, decode_batch_size={decode_batch_size}, "
+            f"composition/restoration={composition_device}"
+        )
+        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         do_cfg = guidance_scale > 1.0
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -232,6 +257,13 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         whisper_chunks  = self.audio_encoder.feature2chunks(
             feature_array=whisper_feature, fps=video_fps
         )
+        # Whisper is only needed while creating CPU audio chunks.  Releasing it
+        # before diffusion makes the CUDA residency contract explicit.
+        if cpu_offload and hasattr(self.audio_encoder, "model"):
+            self.audio_encoder.model.to("cpu")
+            print("[LatentSyncEnhanced] Offloaded Whisper encoder to CPU after feature extraction.")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         audio_samples = read_audio(audio_path)
 
         # Use actual audio duration (samples) as ground truth for target frame count.
@@ -241,7 +273,9 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         whisper_chunks = whisper_chunks[:actual_audio_frames]
 
         # ── Video (loop to match audio, no face detection yet) ──────────
-        video_frames = read_video(video_path, use_decord=False)
+        # The node already encoded the input at video_fps.  Do not silently
+        # transcode it back to the legacy 25 FPS default in read_video().
+        video_frames = read_video(video_path, change_fps=False, use_decord=False)
         video_frames = self._loop_frames_only(video_frames, actual_audio_frames)
 
         total_frames = len(video_frames)
@@ -267,7 +301,8 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             if seg_faces is None:
                 # Every frame in this segment has no face → pass through unchanged
                 all_synced_frames.append(seg_video.copy())
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 continue
 
             # Allocate latents ONLY for this segment (avoids O(total_frames) allocation)
@@ -329,24 +364,76 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                             if callback is not None and j % callback_steps == 0:
                                 callback(j, t, latents)
 
-                decoded = self.decode_latents(latents)
-                decoded = self.paste_surrounding_pixels_back(
-                    decoded, ref_pv, 1 - masks, device, weight_dtype
-                )
-                synced_chunk.append(decoded)
+                # The UNet no longer needs its conditioning tensors.  Delete
+                # them before entering VAE decode so their allocations cannot
+                # overlap the decoder's peak activation memory.
+                del masked_pv, mask_latents, masked_img_latents, ref_latents
+                if audio_embeds is not None:
+                    del audio_embeds
+                if "unet_in" in locals():
+                    del unet_in
+                if "noise_pred" in locals():
+                    del noise_pred
+                if "noise_uncond" in locals():
+                    del noise_uncond
+                if "noise_audio" in locals():
+                    del noise_audio
+                if "null" in locals():
+                    del null
 
-                # Free per-batch GPU tensors immediately
-                del ref_pv, masked_pv, masks, mask_latents, masked_img_latents, ref_latents
+                # Decode and restore one bounded batch at a time.  In CPU
+                # offload mode every operation after VAE.decode is explicitly
+                # CPU-owned, so no CUDA tensor is retained by synced_chunk.
+                window_start = i * num_frames
+                for decode_start, decode_end in iter_frame_batches(
+                    latents.shape[2], decode_batch_size
+                ):
+                    decoded = next(
+                        self.decode_latents_stream(
+                            latents[:, :, decode_start:decode_end],
+                            decode_batch_size=decode_batch_size,
+                            output_device=composition_device,
+                        )
+                    )
+                    decoded = decoded.to(device=composition_device, dtype=composition_dtype)
+                    ref_slice = ref_pv[decode_start:decode_end]
+                    mask_slice = masks[decode_start:decode_end]
+                    composed = self.paste_surrounding_pixels_back(
+                        decoded,
+                        ref_slice,
+                        1 - mask_slice,
+                        composition_device,
+                        composition_dtype,
+                    )
+                    if cpu_offload:
+                        composed = composed.to(device="cpu", dtype=torch.float32)
+
+                    local_no_face_set = {
+                        index - decode_start
+                        for index in no_face_set
+                        if decode_start <= index < decode_end
+                    }
+                    restored = self._restore_segment(
+                        composed,
+                        seg_video[window_start + decode_start : window_start + decode_end],
+                        seg_boxes[window_start + decode_start : window_start + decode_end],
+                        seg_matrices[window_start + decode_start : window_start + decode_end],
+                        local_no_face_set,
+                    )
+                    synced_chunk.append(restored)
+                    del decoded, ref_slice, mask_slice, composed, restored
+
+                # ref_pv and masks are CPU storage tensors needed only for this
+                # window; release their references before the next window.
+                del ref_pv, masks, latents
 
             # Restore faces → numpy output for this segment
-            seg_out = self._restore_segment(
-                torch.cat(synced_chunk), seg_video, seg_boxes, seg_matrices, no_face_set
-            )
-            all_synced_frames.append(seg_out)
+            all_synced_frames.append(np.concatenate(synced_chunk, axis=0))
 
             # Aggressively free segment allocations
             del seg_faces, seg_boxes, seg_matrices, seg_latents, synced_chunk
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # ── Assemble and write output ────────────────────────────────────
         synced_video_frames = np.concatenate(all_synced_frames, axis=0)
@@ -487,15 +574,27 @@ class LatentSyncEnhancedNode:
             scheduler=scheduler,
         ).to("cuda")
 
-        # DeepCache (optional speed-up)
-        try:
-            from DeepCache import DeepCacheSDHelper
-            helper = DeepCacheSDHelper(pipe=pipeline)
-            helper.set_params(cache_interval=3, cache_branch_id=0)
-            helper.enable()
-            print("[LatentSyncEnhanced] DeepCache enabled.")
-        except ImportError:
-            print("[LatentSyncEnhanced] DeepCache not available, skipping.")
+        # DeepCache retains UNet activations.  Keep it for larger cards, but
+        # disable it automatically on low-VRAM GPUs unless explicitly forced.
+        deepcache_setting = os.getenv("LATENTSYNC_ENABLE_DEEPCACHE", "auto").lower()
+        low_vram = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(0).total_memory / (1024 ** 3) <= 16
+        )
+        enable_deepcache = deepcache_setting == "1" or (
+            deepcache_setting == "auto" and not low_vram
+        )
+        if enable_deepcache:
+            try:
+                from DeepCache import DeepCacheSDHelper
+                helper = DeepCacheSDHelper(pipe=pipeline)
+                helper.set_params(cache_interval=3, cache_branch_id=0)
+                helper.enable()
+                print("[LatentSyncEnhanced] DeepCache enabled.")
+            except ImportError:
+                print("[LatentSyncEnhanced] DeepCache not available, skipping.")
+        else:
+            print("[LatentSyncEnhanced] DeepCache disabled by low-VRAM policy.")
 
         return pipeline
 
@@ -513,7 +612,13 @@ class LatentSyncEnhancedNode:
                 torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
             torch.cuda.empty_cache()
-            torch.cuda.set_per_process_memory_fraction(0.8)
+            memory_fraction = os.getenv("LATENTSYNC_MEMORY_FRACTION")
+            if memory_fraction:
+                torch.cuda.set_per_process_memory_fraction(float(memory_fraction))
+                print(
+                    "[LatentSyncEnhanced] CUDA allocator fraction set to "
+                    f"{memory_fraction} by LATENTSYNC_MEMORY_FRACTION."
+                )
 
         weight_dtype = torch.float16 if use_fp16 else torch.float32
 
@@ -534,12 +639,9 @@ class LatentSyncEnhancedNode:
                 frames = images
             frames_uint8 = (frames.cpu() * 255).to(torch.uint8)
 
-            try:
-                import torchvision.io as tio
-                tio.write_video(temp_video_path, frames_uint8, fps=video_fps, video_codec="h264")
-            except Exception:
-                import imageio
-                imageio.mimsave(temp_video_path, frames_uint8.numpy(), fps=video_fps, macro_block_size=1)
+            # ImageIO is the maintained video I/O boundary.  TorchVision's
+            # encode_video/read_video APIs are deprecated and version-sensitive.
+            write_video(temp_video_path, frames_uint8.numpy(), fps=video_fps)
 
             # ── Prepare input audio ─────────────────────────────────────
             waveform    = audio["waveform"]
@@ -591,6 +693,12 @@ class LatentSyncEnhancedNode:
                 mask_image_path=mask_image_path,
                 chunk_frames=chunk_frames,
                 video_fps=video_fps,
+                # Keep the ComfyUI node inputs unchanged.  Advanced users can
+                # tune this internal bound with LATENTSYNC_DECODE_BATCH_SIZE.
+                decode_batch_size=resolve_decode_batch_size(
+                    os.getenv("LATENTSYNC_DECODE_BATCH_SIZE", "1")
+                ),
+                cpu_offload=True,
             )
 
             if torch.cuda.is_available():
@@ -600,9 +708,8 @@ class LatentSyncEnhancedNode:
                 raise FileNotFoundError(f"Output video not found: {output_video_path}")
 
             # ── Read result ─────────────────────────────────────────────
-            import torchvision.io as tio
-            processed_frames = tio.read_video(output_video_path, pts_unit="sec")[0]
-            processed_frames = processed_frames.float() / 255.0
+            processed_frames = read_video_file(output_video_path)
+            processed_frames = torch.from_numpy(processed_frames).float() / 255.0
 
             return (processed_frames.cpu(), resampled_audio)
 

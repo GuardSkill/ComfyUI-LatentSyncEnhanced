@@ -34,6 +34,7 @@ from ..models.unet import UNet3DConditionModel
 from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
 from ..whisper.audio2feature import Audio2Feature
+from ..utils.device_utils import iter_frame_batches, resolve_decode_batch_size
 import tqdm
 import soundfile as sf
 
@@ -140,10 +141,34 @@ class LipsyncPipeline(DiffusionPipeline):
         return self.device
 
     def decode_latents(self, latents):
-        latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
-        latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        decoded_latents = self.vae.decode(latents).sample
-        return decoded_latents
+        return torch.cat(list(self.decode_latents_stream(latents)), dim=0)
+
+    def decode_latents_stream(
+        self,
+        latents: torch.Tensor,
+        decode_batch_size: int = 1,
+        output_device: Optional[Union[str, torch.device]] = None,
+    ):
+        """Decode temporal latent batches without retaining CUDA outputs.
+
+        The flattened VAE batch is decoded in bounded pieces.  Each completed
+        piece may be moved to ``output_device`` before the next VAE call, which
+        is the key memory boundary used by the enhanced pipeline.
+        """
+
+        decode_batch_size = resolve_decode_batch_size(decode_batch_size)
+        scale = self.vae.config.scaling_factor
+        shift = self.vae.config.shift_factor
+        scaled_latents = latents / scale + shift
+        flat_latents = rearrange(scaled_latents, "b c f h w -> (b f) c h w")
+        target_device = torch.device(output_device) if output_device is not None else None
+
+        for start, end in iter_frame_batches(flat_latents.shape[0], decode_batch_size):
+            decoded = self.vae.decode(flat_latents[start:end]).sample
+            if target_device is not None:
+                decoded = decoded.to(device=target_device)
+            yield decoded
+            del decoded
 
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
@@ -201,6 +226,7 @@ class LipsyncPipeline(DiffusionPipeline):
         mask = torch.nn.functional.interpolate(
             mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
         )
+        device = torch.device(device)
         masked_image = masked_image.to(device=device, dtype=dtype)
 
         # encode the mask image into latents space so we can concatenate it to the latents
@@ -222,6 +248,7 @@ class LipsyncPipeline(DiffusionPipeline):
         return mask, masked_image_latents
 
     def prepare_image_latents(self, images, device, dtype, generator, do_classifier_free_guidance):
+        device = torch.device(device)
         images = images.to(device=device, dtype=dtype)
         image_latents = self.vae.encode(images).latent_dist.sample(generator=generator)
         image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
@@ -238,6 +265,8 @@ class LipsyncPipeline(DiffusionPipeline):
     @staticmethod
     def paste_surrounding_pixels_back(decoded_latents, pixel_values, masks, device, weight_dtype):
         # Paste the surrounding pixels back, because we only want to change the mouth region
+        device = torch.device(device)
+        decoded_latents = decoded_latents.to(device=device, dtype=weight_dtype)
         pixel_values = pixel_values.to(device=device, dtype=weight_dtype)
         masks = masks.to(device=device, dtype=weight_dtype)
         combined_pixel_values = decoded_latents * masks + pixel_values * (1 - masks)

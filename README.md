@@ -9,7 +9,7 @@ Improvements over the original wrapper:
 | Frame with no face | ❌ Crashes | ✅ Warning + pass-through |
 | All frames have no face | ❌ Crashes | ✅ Warning + return original video |
 | Model path | Node's own `checkpoints/` symlink | ✅ ComfyUI standard `models/checkpoints/LatentSync-1.6/` |
-| OOM on long videos | ❌ Possible | ✅ Configurable `chunk_frames` (default 80, safe for 24 GB VRAM) |
+| OOM on long videos | ❌ Possible | ✅ Segmenting plus bounded VAE decode and CPU offload |
 
 ---
 
@@ -75,7 +75,7 @@ huggingface-cli download ByteDance/LatentSync-1.6 \
 | `seed` | INT | 1247 | Random seed for reproducibility |
 | `lips_expression` | FLOAT | 1.5 | Lip movement strength (guidance scale). Range: 1.0–3.0 |
 | `inference_steps` | INT | 20 | Diffusion denoising steps. More = slower but higher quality |
-| `chunk_frames` | INT | 80 | Frames per processing segment. **Reduce if you hit OOM.** |
+| `chunk_frames` | INT | 80 | Frames per processing segment. Reduce for lower CPU/RAM usage. |
 
 ### chunk_frames guide (VRAM)
 
@@ -85,6 +85,16 @@ huggingface-cli download ByteDance/LatentSync-1.6 \
 | 16 GB | 48 |
 | 12 GB | 32 |
 | 8 GB | 16 |
+
+### Low-VRAM controls
+
+The ComfyUI node interface stays unchanged. VAE decoding defaults to one
+frame per CUDA call, then moves each completed batch to CPU for composition and
+restoration. Advanced users can set `LATENTSYNC_DECODE_BATCH_SIZE` to a small
+positive integer (for example `2`) when more VRAM is available. DeepCache is
+disabled automatically on GPUs with 16 GB or less; override this with
+`LATENTSYNC_ENABLE_DEEPCACHE=1`. `LATENTSYNC_MEMORY_FRACTION` is optional and
+only applies when explicitly set.
 
 ---
 

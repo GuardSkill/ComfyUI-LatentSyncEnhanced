@@ -100,6 +100,19 @@ def read_video_cv2(video_path: str):
     return np.array(frames)
 
 
+def read_video_file(video_path: str) -> np.ndarray:
+    """Read all frames with ImageIO instead of deprecated TorchVision video I/O."""
+
+    reader = imageio.get_reader(video_path)
+    try:
+        frames = [frame for frame in reader]
+    finally:
+        reader.close()
+    if not frames:
+        return np.empty((0,), dtype=np.uint8)
+    return np.stack(frames, axis=0)
+
+
 def read_audio(audio_path: str, audio_sample_rate: int = 16000):
     if audio_path is None:
         raise ValueError("Audio path is required.")

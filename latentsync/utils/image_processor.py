@@ -18,7 +18,7 @@ import cv2
 from einops import rearrange
 import torch
 import numpy as np
-from typing import Union
+from typing import Optional, Union
 from .affine_transform import AlignRestore
 from .face_detector import FaceDetector
 
@@ -32,24 +32,41 @@ def load_fixed_mask(resolution: int, mask_image_path="latentsync/utils/mask.png"
 
 
 class ImageProcessor:
-    def __init__(self, resolution: int = 512, device: str = "cpu", mask_image=None):
+    def __init__(
+        self,
+        resolution: int = 512,
+        device: str = "cpu",
+        mask_image=None,
+        restore_device: Optional[str] = None,
+        detector_device: Optional[str] = None,
+    ):
         self.resolution = resolution
+        self.device = torch.device(device)
+        self.restore_device = torch.device(restore_device or device)
+        self.detector_device = torch.device(detector_device or device)
         self.resize = transforms.Resize(
             (resolution, resolution), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
         )
         self.normalize = transforms.Normalize([0.5], [0.5], inplace=True)
 
-        self.restorer = AlignRestore(resolution=resolution, device=device)
+        self.restorer = AlignRestore(
+            resolution=resolution,
+            device=self.restore_device,
+            dtype=torch.float32 if self.restore_device.type == "cpu" else torch.float16,
+        )
 
         if mask_image is None:
             self.mask_image = load_fixed_mask(resolution)
         else:
             self.mask_image = mask_image
+        # Geometry and mask preparation are CPU-owned.  The mask is copied to
+        # the diffusion device only by the VAE/UNet preparation helpers.
+        self.mask_image = self.mask_image.to(device="cpu", dtype=torch.float32)
 
-        if device == "cpu":
+        if self.detector_device.type == "cpu":
             self.face_detector = None
         else:
-            self.face_detector = FaceDetector(device=device)
+            self.face_detector = FaceDetector(device=str(self.detector_device))
 
     def affine_transform(self, image: torch.Tensor) -> np.ndarray:
         if self.face_detector is None:
@@ -76,8 +93,9 @@ class ImageProcessor:
         else:
             image = self.resize(image)
         pixel_values = self.normalize(image / 255.0)
-        masked_pixel_values = pixel_values * self.mask_image
-        return pixel_values, masked_pixel_values, self.mask_image[0:1]
+        mask_image = self.mask_image.to(device=pixel_values.device, dtype=pixel_values.dtype)
+        masked_pixel_values = pixel_values * mask_image
+        return pixel_values, masked_pixel_values, mask_image[0:1]
 
     def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False):
         if isinstance(images, np.ndarray):
