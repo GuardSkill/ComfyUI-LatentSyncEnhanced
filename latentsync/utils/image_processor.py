@@ -26,6 +26,7 @@ from .yaw_mask import (
     facial_contour_mask,
     max_editable_coverage,
     estimate_yaw_from_landmarks,
+    mouth_roi_geometry,
 )
 
 
@@ -181,6 +182,7 @@ class ImageProcessor:
                 f"got {tuple(canonical_mask.shape)}"
             )
         canonical_mask = canonical_mask[0:1]
+        canonical_editable = (1.0 - canonical_mask).clamp(0.0, 1.0)
         if aligned_landmarks is None:
             contour_mask = torch.ones_like(canonical_mask)
         else:
@@ -191,17 +193,56 @@ class ImageProcessor:
                 device=canonical_mask.device,
                 dtype=canonical_mask.dtype,
             )
-        adapted_mask = adapt_canonical_mask(
-            canonical_mask, yaw, contour_mask=contour_mask
+        yaw_adapted_mask = adapt_canonical_mask(canonical_mask, yaw)
+        mouth_geometry_fallback = False
+        if aligned_landmarks is None:
+            local_mouth_mask = torch.ones_like(canonical_mask)
+        else:
+            mouth_geometry = mouth_roi_geometry(
+                aligned_landmarks,
+                canonical_mask.shape[-2],
+                canonical_mask.shape[-1],
+            )
+            if mouth_geometry["valid"]:
+                local_mouth_mask = torch.from_numpy(
+                    mouth_geometry["mask"]
+                ).to(
+                    device=canonical_mask.device,
+                    dtype=canonical_mask.dtype,
+                ).unsqueeze(0)
+            else:
+                # Invalid landmark geometry falls back to the canonical
+                # editable region, never to a rectangular ROI.
+                local_mouth_mask = torch.ones_like(canonical_mask)
+                mouth_geometry_fallback = True
+
+        # Geometry masks use 1 for editable/allowed pixels while the
+        # production diffusion mask uses 1 for preserved pixels.
+        yaw_editable = (1.0 - yaw_adapted_mask).clamp(0.0, 1.0)
+        if mouth_geometry_fallback:
+            yaw_editable = torch.minimum(yaw_editable, canonical_editable)
+        mouth_roi_strength = local_mouth_mask.clamp(0.0, 1.0)
+        facial_contour_strength = contour_mask.clamp(0.0, 1.0)
+        final_editable_strength = (
+            yaw_editable * mouth_roi_strength * facial_contour_strength
         )
-        editable = (1.0 - adapted_mask).clamp(0.0, 1.0)
+        # Keep the pixel-wise subset invariant explicit at the final stage.
+        final_editable_strength = torch.minimum(
+            final_editable_strength, yaw_editable
+        )
+        final_editable_strength = torch.minimum(
+            final_editable_strength, mouth_roi_strength
+        )
+        final_editable_strength = torch.minimum(
+            final_editable_strength, facial_contour_strength
+        )
         coverage_limit = max_editable_coverage()
-        coverage = float(editable.mean())
+        coverage = float(final_editable_strength.mean())
         if coverage > coverage_limit:
-            editable = editable * (
+            final_editable_strength = final_editable_strength * (
                 float(coverage_limit) * (1.0 - 1e-6) / coverage
             )
-        mask_image = (1.0 - editable).clamp(0.0, 1.0)
+        mask_image = (1.0 - final_editable_strength).clamp(0.0, 1.0)
         masked_pixel_values = pixel_values * mask_image
         return pixel_values, masked_pixel_values, mask_image[0:1]
 

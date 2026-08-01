@@ -14,6 +14,24 @@ MAX_SHIFT_ENV = "LATENTSYNC_MOUTH_MAX_HORIZONTAL_SHIFT"
 CONTOUR_FEATHER_ENV = "LATENTSYNC_MOUTH_CONTOUR_FEATHER"
 MAX_EDITABLE_COVERAGE_ENV = "LATENTSYNC_MOUTH_MAX_EDITABLE_COVERAGE"
 
+MOUTH_HORIZONTAL_PADDING_ENV = "LATENTSYNC_MOUTH_HORIZONTAL_PADDING"
+MOUTH_UPPER_PADDING_ENV = "LATENTSYNC_MOUTH_UPPER_PADDING"
+MOUTH_LOWER_PADDING_ENV = "LATENTSYNC_MOUTH_LOWER_PADDING"
+MOUTH_DILATION_FRACTION_ENV = "LATENTSYNC_MOUTH_DILATION_FRACTION"
+MOUTH_FEATHER_FRACTION_ENV = "LATENTSYNC_MOUTH_FEATHER_FRACTION"
+MAX_MOUTH_ROI_COVERAGE_ENV = "LATENTSYNC_MOUTH_MAX_ROI_COVERAGE"
+MOUTH_ROI_HARD_MAX_COVERAGE = 0.08
+
+MOUTH_OUTER_LANDMARK_INDICES = [
+    52, 64, 63, 71, 67, 68, 61, 58, 59, 53, 56, 55
+]
+MOUTH_INNER_LANDMARK_INDICES = [65, 66, 62, 70, 69, 57, 60, 54]
+MOUTH_LANDMARK_INDICES = MOUTH_OUTER_LANDMARK_INDICES
+EYE_LANDMARK_INDICES = [
+    35, 41, 42, 39, 37, 36, 89, 95, 96, 93, 91, 90
+]
+
+
 FACE_CONTOUR_INDICES = [
     1, 9, 10, 11, 12, 13, 14, 15, 16, 2, 3, 4, 5, 6, 7, 8, 0,
     24, 23, 22, 21, 20, 19, 18, 32, 31, 30, 29, 28, 27, 26, 25, 17,
@@ -48,6 +66,38 @@ def yaw_mask_config() -> tuple[float, float, float, float]:
 def max_editable_coverage() -> float:
     """Return the maximum fraction of the aligned crop that may be edited."""
     return _env_float(MAX_EDITABLE_COVERAGE_ENV, 0.18, 0.01, 0.50)
+
+def mouth_roi_config() -> dict[str, float]:
+    """Return bounded mouth-relative padding and rasterization settings."""
+    return {
+        "horizontal_padding": _env_float(
+            MOUTH_HORIZONTAL_PADDING_ENV, 0.12, 0.0, 0.40
+        ),
+        "upper_padding": _env_float(
+            MOUTH_UPPER_PADDING_ENV, 0.20, 0.0, 0.75
+        ),
+        "lower_padding": _env_float(
+            MOUTH_LOWER_PADDING_ENV, 0.30, 0.0, 0.75
+        ),
+        "dilation_fraction": _env_float(
+            MOUTH_DILATION_FRACTION_ENV, 0.06, 0.0, 0.12
+        ),
+        "feather_fraction": _env_float(
+            MOUTH_FEATHER_FRACTION_ENV, 0.08, 0.0, 0.20
+        ),
+        "max_coverage": _env_float(
+            MAX_MOUTH_ROI_COVERAGE_ENV,
+            MOUTH_ROI_HARD_MAX_COVERAGE,
+            0.01,
+            MOUTH_ROI_HARD_MAX_COVERAGE,
+        ),
+    }
+
+
+def max_mouth_roi_coverage() -> float:
+    """Return the maximum fractional area of a valid mouth ROI."""
+    return mouth_roi_config()["max_coverage"]
+
 
 
 def signed_polygon_area(points: np.ndarray) -> float:
@@ -109,6 +159,292 @@ def validate_polygon(
     if area >= 0.0:
         return False, "unexpected_winding", area
     return True, "ok", area
+
+
+def validate_mouth_polygon(
+    points: np.ndarray,
+    height: int,
+    width: int,
+    minimum_points: int = len(MOUTH_OUTER_LANDMARK_INDICES),
+) -> tuple[bool, str, float]:
+    """Validate the fixed outer-lip walk before rasterization."""
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1:] != (2,) or len(points) < minimum_points:
+        return False, "insufficient_points", 0.0
+    if not np.isfinite(points).all():
+        return False, "non_finite", 0.0
+    if (
+        len(np.unique(points, axis=0)) < minimum_points
+        or np.any(points[:, 0] < 0)
+        or np.any(points[:, 0] >= width)
+        or np.any(points[:, 1] < 0)
+        or np.any(points[:, 1] >= height)
+    ):
+        return False, "out_of_bounds", signed_polygon_area(points)
+    if polygon_self_intersects(points):
+        return False, "self_intersection", signed_polygon_area(points)
+    area = signed_polygon_area(points)
+    if abs(area) < 1.0:
+        return False, "zero_area", area
+    # The JD outer-lip walk is counter-clockwise in image coordinates.
+    if area <= 0.0:
+        return False, "unexpected_winding", area
+    return True, "ok", area
+
+
+def closed_mouth_polygon(aligned_landmarks_106: np.ndarray) -> np.ndarray:
+    """Return the selected outer-lip points with the first point repeated."""
+    landmarks = np.asarray(aligned_landmarks_106, dtype=np.float32)
+    if landmarks.shape != (106, 2):
+        raise ValueError(
+            f"Expected aligned landmarks with shape (106, 2), got {landmarks.shape}"
+        )
+    points = landmarks[MOUTH_OUTER_LANDMARK_INDICES].copy()
+    return np.concatenate([points, points[:1]], axis=0)
+
+
+def _mask_centroid(mask: np.ndarray) -> tuple[float, float] | None:
+    weights = np.asarray(mask, dtype=np.float64)
+    total = float(weights.sum())
+    if total <= 1e-8:
+        return None
+    y, x = np.indices(weights.shape, dtype=np.float64)
+    return float((weights * x).sum() / total), float((weights * y).sum() / total)
+
+
+def _mask_bounds(
+    mask: np.ndarray, threshold: float = 1e-6
+) -> tuple[int, int, int, int] | None:
+    ys, xs = np.where(np.asarray(mask) > threshold)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _empty_mouth_roi_geometry(height: int, width: int, reason: str) -> dict:
+    zeros = np.zeros((height, width), dtype=np.float32)
+    return {
+        "valid": False,
+        "reason": reason,
+        "mask": zeros,
+        "raw_polygon": zeros.copy(),
+        "dilated_roi": zeros.copy(),
+        "feathered_roi": zeros.copy(),
+        "outer_points": np.empty((0, 2), dtype=np.float32),
+        "closed_points": np.empty((0, 2), dtype=np.float32),
+        "mouth_centroid": None,
+        "roi_centroid": None,
+        "mouth_width": 0.0,
+        "mouth_height": 0.0,
+        "dilation_radius": 0,
+        "feather_radius": 0,
+        "raw_coverage": 0.0,
+        "dilated_coverage": 0.0,
+        "feathered_coverage": 0.0,
+        "roi_bounds": None,
+    }
+
+
+def mouth_roi_geometry(
+    aligned_landmarks_106,
+    height: int,
+    width: int,
+    *,
+    horizontal_padding: float | None = None,
+    upper_padding: float | None = None,
+    lower_padding: float | None = None,
+    dilation_fraction: float | None = None,
+    feather_fraction: float | None = None,
+    max_coverage: float | None = None,
+) -> dict:
+    """Build a bounded, feathered, landmark-shaped mouth ROI.
+
+    Geometry masks use 1 for editable/allowed pixels. Invalid geometry
+    returns a zero mask so the caller can choose the canonical fallback.
+    """
+    import cv2
+
+    height, width = int(height), int(width)
+    if height <= 0 or width <= 0:
+        return _empty_mouth_roi_geometry(
+            max(height, 1), max(width, 1), "invalid_crop"
+        )
+
+    config = mouth_roi_config()
+    horizontal_padding = (
+        config["horizontal_padding"]
+        if horizontal_padding is None
+        else float(horizontal_padding)
+    )
+    upper_padding = (
+        config["upper_padding"] if upper_padding is None else float(upper_padding)
+    )
+    lower_padding = (
+        config["lower_padding"] if lower_padding is None else float(lower_padding)
+    )
+    dilation_fraction = (
+        config["dilation_fraction"]
+        if dilation_fraction is None
+        else float(dilation_fraction)
+    )
+    feather_fraction = (
+        config["feather_fraction"]
+        if feather_fraction is None
+        else float(feather_fraction)
+    )
+    max_coverage = (
+        config["max_coverage"] if max_coverage is None else float(max_coverage)
+    )
+    max_coverage = float(
+        np.clip(max_coverage, 0.01, MOUTH_ROI_HARD_MAX_COVERAGE)
+    )
+
+    landmarks = np.asarray(aligned_landmarks_106, dtype=np.float32)
+    if landmarks.shape != (106, 2) or not np.isfinite(landmarks).all():
+        return _empty_mouth_roi_geometry(height, width, "invalid_landmarks")
+
+    outer_points = landmarks[MOUTH_OUTER_LANDMARK_INDICES].copy()
+    valid, reason, _ = validate_mouth_polygon(outer_points, height, width)
+    if not valid:
+        geometry = _empty_mouth_roi_geometry(height, width, reason)
+        geometry["outer_points"] = outer_points
+        geometry["closed_points"] = np.concatenate(
+            [outer_points, outer_points[:1]], axis=0
+        )
+        return geometry
+
+    x0, y0 = outer_points.min(axis=0)
+    x1, y1 = outer_points.max(axis=0)
+    mouth_width = float(x1 - x0)
+    mouth_height = float(y1 - y0)
+    mouth_centroid = tuple(float(value) for value in outer_points.mean(axis=0))
+
+    raw_polygon = np.zeros((height, width), dtype=np.float32)
+    closed_points = np.concatenate([outer_points, outer_points[:1]], axis=0)
+    cv2.fillPoly(raw_polygon, [np.rint(closed_points).astype(np.int32)], 1.0)
+
+    # Padding is relative to the detected lip bounds, not the whole crop.
+    pad_x = float(np.clip(horizontal_padding, 0.0, 0.40))
+    pad_upper = float(np.clip(upper_padding, 0.0, 0.75))
+    pad_lower = float(np.clip(lower_padding, 0.0, 0.75))
+    x_center = (float(x0) + float(x1)) * 0.5
+    padded_points = outer_points.copy()
+    padded_points[:, 0] = x_center + (
+        padded_points[:, 0] - x_center
+    ) * (1.0 + 2.0 * pad_x)
+    padded_points[:, 1] = float(y0) - pad_upper * mouth_height + (
+        (padded_points[:, 1] - float(y0)) / mouth_height
+    ) * (mouth_height * (1.0 + pad_upper + pad_lower))
+    padded_points[:, 0] = np.clip(padded_points[:, 0], 0.0, width - 1.0)
+    padded_points[:, 1] = np.clip(padded_points[:, 1], 0.0, height - 1.0)
+
+    scale = max(min(mouth_width, mouth_height), 1.0)
+    max_dilation_radius = max(1, int(round(0.12 * scale)))
+    dilation_radius = int(
+        np.clip(round(float(dilation_fraction) * scale), 1, max_dilation_radius)
+    )
+    padded_polygon = np.zeros((height, width), dtype=np.float32)
+    padded_closed = np.concatenate([padded_points, padded_points[:1]], axis=0)
+    cv2.fillPoly(padded_polygon, [np.rint(padded_closed).astype(np.int32)], 1.0)
+    dilation_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * dilation_radius + 1, 2 * dilation_radius + 1),
+    )
+    dilated_roi = cv2.dilate(padded_polygon, dilation_kernel, iterations=1)
+
+    max_feather_radius = max(1, int(round(0.20 * scale)))
+    feather_radius = int(
+        np.clip(round(float(feather_fraction) * scale), 1, max_feather_radius)
+    )
+    feather_kernel = 2 * feather_radius + 1
+    feathered_roi = cv2.GaussianBlur(
+        dilated_roi,
+        (feather_kernel, feather_kernel),
+        sigmaX=max(feather_radius / 2.0, 0.5),
+    ).astype(np.float32)
+    feathered_roi = np.clip(feathered_roi, 0.0, 1.0)
+
+    raw_coverage = float(raw_polygon.mean())
+    dilated_coverage = float(dilated_roi.mean())
+    feathered_coverage = float(feathered_roi.mean())
+    roi_centroid = _mask_centroid(feathered_roi)
+    roi_bounds = _mask_bounds(feathered_roi)
+    geometry = {
+        "valid": True,
+        "reason": "ok",
+        "mask": feathered_roi.copy(),
+        "raw_polygon": raw_polygon,
+        "dilated_roi": dilated_roi.astype(np.float32),
+        "feathered_roi": feathered_roi,
+        "outer_points": outer_points,
+        "closed_points": closed_points,
+        "padded_points": padded_points,
+        "mouth_centroid": mouth_centroid,
+        "roi_centroid": roi_centroid,
+        "mouth_width": mouth_width,
+        "mouth_height": mouth_height,
+        "dilation_radius": dilation_radius,
+        "feather_radius": feather_radius,
+        "raw_coverage": raw_coverage,
+        "dilated_coverage": dilated_coverage,
+        "feathered_coverage": feathered_coverage,
+        "roi_bounds": roi_bounds,
+    }
+
+    # Safety checks make malformed geometry fail closed.
+    if feathered_coverage > max_coverage:
+        geometry["valid"] = False
+        geometry["reason"] = "coverage_limit"
+    elif roi_centroid is None:
+        geometry["valid"] = False
+        geometry["reason"] = "empty_roi"
+    else:
+        dx = abs(roi_centroid[0] - mouth_centroid[0])
+        dy = abs(roi_centroid[1] - mouth_centroid[1])
+        if dx > max(0.35 * mouth_width, 2.0) or dy > max(
+            0.50 * mouth_height, 2.0
+        ):
+            geometry["valid"] = False
+            geometry["reason"] = "centroid_drift"
+
+    if geometry["valid"] and roi_bounds is not None:
+        _, roi_top, _, roi_bottom = roi_bounds
+        eye_points = landmarks[EYE_LANDMARK_INDICES]
+        if np.ptp(eye_points, axis=0).max() > 1.0 and np.max(
+            np.abs(eye_points)
+        ) > 1.0:
+            eye_bottom = float(np.max(eye_points[:, 1]))
+            if roi_top < eye_bottom:
+                geometry["valid"] = False
+                geometry["reason"] = "reaches_eyes"
+
+        contour_points = landmarks[FACE_CONTOUR_INDICES]
+        if geometry["valid"] and np.ptp(contour_points, axis=0).max() > 1.0:
+            chin_y = float(np.max(contour_points[:, 1]))
+            if roi_bottom > chin_y + max(2.0, 0.10 * mouth_height):
+                geometry["valid"] = False
+                geometry["reason"] = "below_chin"
+
+    if not geometry["valid"]:
+        geometry["mask"] = np.zeros((height, width), dtype=np.float32)
+    return geometry
+
+
+def mouth_roi_mask(
+    aligned_landmarks_106,
+    height: int,
+    width: int,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+    **kwargs,
+) -> torch.Tensor:
+    """Return a feathered landmark-shaped ROI; one means editable/allowed."""
+    geometry = mouth_roi_geometry(aligned_landmarks_106, height, width, **kwargs)
+    return torch.from_numpy(geometry["mask"]).to(
+        device=device, dtype=dtype
+    ).unsqueeze(0)
+
+
 
 
 def estimate_yaw_from_landmarks(landmarks_2d_106: np.ndarray) -> float:

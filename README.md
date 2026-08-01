@@ -122,6 +122,27 @@ Invalid values warn and fall back to the documented defaults. Mask polarity is
 `0 = editable` and `1 = preserved`; contour clipping only removes editable
 pixels outside the detected face polygon.
 
+### Landmark-shaped mouth ROI controls
+
+The production mouth region is rasterized from the ordered JD/InsightFace
+outer-lip landmarks (`52, 64, 63, 71, 67, 68, 61, 58, 59, 53, 56, 55`).
+Padding is relative to the detected lip bounds, followed by bounded elliptical
+dilation and Gaussian feathering. Centroid, eye, chin, and coverage checks make
+invalid geometry fall back to the canonical editable mouth mask.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `LATENTSYNC_MOUTH_HORIZONTAL_PADDING` | `0.12` | Relative padding on each horizontal side |
+| `LATENTSYNC_MOUTH_UPPER_PADDING` | `0.20` | Relative padding above the outer lip |
+| `LATENTSYNC_MOUTH_LOWER_PADDING` | `0.30` | Relative padding below the outer lip |
+| `LATENTSYNC_MOUTH_DILATION_FRACTION` | `0.06` | Bounded dilation radius relative to mouth size |
+| `LATENTSYNC_MOUTH_FEATHER_FRACTION` | `0.08` | Gaussian feather radius relative to mouth size |
+| `LATENTSYNC_MOUTH_MAX_ROI_COVERAGE` | `0.08` | Hard cap for valid mouth-ROI crop coverage |
+
+These controls affect only the editable-mask intersection. The final editable
+strength remains a subset of the yaw-adapted mask, mouth ROI, and facial
+contour mask.
+
 ---
 
 ## Node Outputs
