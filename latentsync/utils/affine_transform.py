@@ -6,6 +6,8 @@ import torch
 from einops import rearrange
 import kornia
 
+from .debug_artifacts import save_artifact_image
+
 
 class AlignRestore(object):
     def __init__(self, align_points=3, resolution=256, device="cpu", dtype=torch.float16):
@@ -53,7 +55,7 @@ class AlignRestore(object):
         # preprocessing.  restore_img() moves it to its own device as needed.
         return cropped_face, affine_matrix.detach().cpu()
 
-    def restore_img(self, input_img, face, affine_matrix):
+    def restore_img(self, input_img, face, affine_matrix, debug_frame_index=None):
         h, w, _ = input_img.shape
 
         if isinstance(affine_matrix, np.ndarray):
@@ -71,6 +73,10 @@ class AlignRestore(object):
             face, inv_affine_matrix, (h, w), mode="bilinear", padding_mode="fill", fill_value=self.fill_value
         ).squeeze(0)
         inv_face = (inv_face / 2 + 0.5).clamp(0, 1) * 255
+        if debug_frame_index is not None:
+            save_artifact_image(
+                "inverse_warped_face", debug_frame_index, inv_face, "zero_255"
+            )
 
         input_img = rearrange(
             torch.from_numpy(input_img).to(device=self.device, dtype=self.dtype), "h w c -> c h w"
@@ -78,6 +84,10 @@ class AlignRestore(object):
         inv_mask = kornia.geometry.transform.warp_affine(
             self.mask, inv_affine_matrix, (h, w), padding_mode="zeros"
         )  # (1, 1, h_up, w_up)
+        if debug_frame_index is not None:
+            save_artifact_image(
+                "inverse_mask", debug_frame_index, inv_mask, "zero_one"
+            )
 
         inv_mask_erosion = kornia.morphology.erosion(
             inv_mask,
@@ -116,6 +126,10 @@ class AlignRestore(object):
 
         img_back = rearrange(img_back, "c h w -> h w c").contiguous().to(dtype=torch.uint8)
         img_back = img_back.cpu().numpy()
+        if debug_frame_index is not None:
+            save_artifact_image(
+                "restored_frame", debug_frame_index, img_back, "zero_255"
+            )
         return img_back
 
     def transformation_from_points(self, points1: torch.Tensor, points0: torch.Tensor, smooth=True, p_bias=None):

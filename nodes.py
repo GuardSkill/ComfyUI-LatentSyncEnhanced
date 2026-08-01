@@ -45,6 +45,7 @@ from latentsync.utils.util import (
     check_ffmpeg_installed,
 )
 from latentsync.utils.device_utils import iter_frame_batches, resolve_decode_batch_size
+from latentsync.utils.debug_artifacts import artifact_debug_enabled, save_artifact_image
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.whisper.audio2feature import Audio2Feature
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -85,7 +86,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     # Face detection helpers
     # ------------------------------------------------------------------
 
-    def _safe_affine_transform_segment(self, video_frames):
+    def _safe_affine_transform_segment(self, video_frames, frame_offset=0):
         """
         Run face detection + affine alignment on a segment.
 
@@ -102,8 +103,11 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
         no_face_indices = []
 
         for i, frame in enumerate(tqdm.tqdm(video_frames, desc="Face detection", leave=False)):
+            frame_index = frame_offset + i
+            save_artifact_image("original_frame", frame_index, frame, "zero_255")
             try:
                 face, box, matrix = self.image_processor.affine_transform(frame)
+                save_artifact_image("aligned_face", frame_index, face, "zero_255")
                 faces.append(face)
                 boxes.append(box)
                 matrices.append(matrix)
@@ -142,6 +146,9 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             faces[idx] = faces[nearest]
             boxes[idx] = boxes[nearest]
             matrices[idx] = matrices[nearest]
+            save_artifact_image(
+                "aligned_face", frame_offset + idx, faces[idx], "zero_255"
+            )
 
         return torch.stack(faces), boxes, matrices, no_face_set
 
@@ -149,15 +156,28 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
     # Restoration helper
     # ------------------------------------------------------------------
 
-    def _restore_segment(self, synced_faces, original_frames, boxes, matrices, no_face_set):
+    def _restore_segment(
+        self, synced_faces, original_frames, boxes, matrices, no_face_set, frame_offset=0
+    ):
         """
         Paste synced faces back into original_frames.
         Frames whose index is in no_face_set are returned unchanged.
         """
         out_frames = []
         for i, face in enumerate(tqdm.tqdm(synced_faces, desc="Restoring", leave=False)):
+            frame_index = frame_offset + i
             if i in no_face_set:
                 out_frames.append(original_frames[i])
+                if artifact_debug_enabled():
+                    save_artifact_image(
+                        "inverse_mask",
+                        frame_index,
+                        np.zeros(original_frames[i].shape[:2], dtype=np.uint8),
+                        "zero_255",
+                    )
+                    save_artifact_image(
+                        "restored_frame", frame_index, original_frames[i], "zero_255"
+                    )
                 continue
             x1, y1, x2, y2 = boxes[i]
             h = int(y2 - y1)
@@ -167,8 +187,11 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                 interpolation=transforms.InterpolationMode.BICUBIC,
                 antialias=True,
             )
+            save_artifact_image(
+                "face_before_restore", frame_index, face, "minus_one_one"
+            )
             out_frame = self.image_processor.restorer.restore_img(
-                original_frames[i], face, matrices[i]
+                original_frames[i], face, matrices[i], debug_frame_index=frame_index
             )
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
@@ -296,7 +319,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
             )
 
             seg_faces, seg_boxes, seg_matrices, no_face_set = \
-                self._safe_affine_transform_segment(seg_video)
+                self._safe_affine_transform_segment(seg_video, frame_offset=seg_start)
 
             if seg_faces is None:
                 # Every frame in this segment has no face → pass through unchanged
@@ -398,6 +421,16 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                     decoded = decoded.to(device=composition_device, dtype=composition_dtype)
                     ref_slice = ref_pv[decode_start:decode_end]
                     mask_slice = masks[decode_start:decode_end]
+                    if artifact_debug_enabled():
+                        for batch_index in range(decoded.shape[0]):
+                            frame_index = window_start + decode_start + batch_index
+                            frame_index += seg_start
+                            save_artifact_image(
+                                "decoded_face",
+                                frame_index,
+                                decoded[batch_index],
+                                "minus_one_one",
+                            )
                     composed = self.paste_surrounding_pixels_back(
                         decoded,
                         ref_slice,
@@ -419,6 +452,7 @@ class EnhancedLipsyncPipeline(LipsyncPipeline):
                         seg_boxes[window_start + decode_start : window_start + decode_end],
                         seg_matrices[window_start + decode_start : window_start + decode_end],
                         local_no_face_set,
+                        frame_offset=seg_start + window_start + decode_start,
                     )
                     synced_chunk.append(restored)
                     del decoded, ref_slice, mask_slice, composed, restored
