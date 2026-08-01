@@ -103,6 +103,27 @@ normal default.
 
 ---
 
+### Yaw-aware mask and facial contour controls
+
+The canonical editable mask is adapted continuously for profile faces using
+the signed yaw estimated from the detector landmarks. The editable region is
+also intersected with the visible facial-contour polygon before diffusion.
+These optional environment variables control the formal adaptation:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `LATENTSYNC_MOUTH_YAW_THRESHOLD` | `0.12` | Normalized yaw below which the canonical mask is unchanged |
+| `LATENTSYNC_MOUTH_MAX_HORIZONTAL_SHRINK` | `0.35` | Maximum horizontal shrink fraction |
+| `LATENTSYNC_MOUTH_MAX_HORIZONTAL_SHIFT` | `0.10` | Maximum horizontal shift fraction |
+| `LATENTSYNC_MOUTH_CONTOUR_FEATHER` | `0.02` | Facial-contour feather width as a fraction of crop size |
+| `LATENTSYNC_MOUTH_MAX_EDITABLE_COVERAGE` | `0.18` | Maximum fraction of the aligned crop that may be edited |
+
+Invalid values warn and fall back to the documented defaults. Mask polarity is
+`0 = editable` and `1 = preserved`; contour clipping only removes editable
+pixels outside the detected face polygon.
+
+---
+
 ## Node Outputs
 
 | Output | Type | Description |

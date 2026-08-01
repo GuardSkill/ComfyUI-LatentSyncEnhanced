@@ -21,25 +21,12 @@ import numpy as np
 from typing import Optional, Union
 from .affine_transform import AlignRestore
 from .face_detector import FaceDetector
-
-
-def _estimate_signed_yaw(landmarks_2d_106: np.ndarray) -> float:
-    """Estimate signed yaw from the detector's float landmark coordinates."""
-    landmarks = np.asarray(landmarks_2d_106, dtype=np.float32)
-    if landmarks.shape != (106, 2) or not np.isfinite(landmarks).all():
-        raise ValueError(
-            f"Expected finite detector landmarks with shape (106, 2), got {landmarks.shape}"
-        )
-    left_eye = landmarks[[43, 48, 49, 51, 50]].mean(axis=0)
-    right_eye = landmarks[101:106].mean(axis=0)
-    nose = landmarks[[74, 77, 83, 86]].mean(axis=0)
-    eye_vector = right_eye - left_eye
-    eye_distance = float(np.linalg.norm(eye_vector))
-    if eye_distance < 1e-6:
-        raise ValueError("Cannot estimate yaw from coincident eye centers")
-    eye_axis = eye_vector / eye_distance
-    midpoint = (left_eye + right_eye) * 0.5
-    return float(np.dot(nose - midpoint, eye_axis) / (eye_distance * 0.5))
+from .yaw_mask import (
+    adapt_canonical_mask,
+    facial_contour_mask,
+    max_editable_coverage,
+    estimate_yaw_from_landmarks,
+)
 
 
 def _transform_landmarks_to_aligned(
@@ -82,7 +69,8 @@ def load_fixed_mask(resolution: int, mask_image_path="latentsync/utils/mask.png"
     mask_image = cv2.cvtColor(mask_image, cv2.COLOR_BGR2RGB)
     mask_image = cv2.resize(mask_image, (resolution, resolution), interpolation=cv2.INTER_LANCZOS4) / 255.0
     mask_image = rearrange(torch.from_numpy(mask_image), "h w c -> c h w")
-    return mask_image
+    # The RGB source encodes one scalar production mask.
+    return mask_image[0:1]
 
 
 class ImageProcessor:
@@ -141,7 +129,7 @@ class ImageProcessor:
         pt_left_eye = np.mean(detector_landmarks[[43, 48, 49, 51, 50]], axis=0)  # left eyebrow center
         pt_right_eye = np.mean(detector_landmarks[101:106], axis=0)  # right eyebrow center
         pt_nose = np.mean(detector_landmarks[[74, 77, 83, 86]], axis=0)  # nose center
-        yaw = _estimate_signed_yaw(detector_landmarks)
+        yaw = estimate_yaw_from_landmarks(detector_landmarks)
 
         landmarks3 = np.round([pt_left_eye, pt_right_eye, pt_nose])
 
@@ -182,7 +170,38 @@ class ImageProcessor:
         else:
             image = self.resize(image)
         pixel_values = self.normalize(image / 255.0)
-        mask_image = self.mask_image.to(device=pixel_values.device, dtype=pixel_values.dtype)
+        canonical_mask = self.mask_image.to(
+            device=pixel_values.device, dtype=pixel_values.dtype
+        )
+        if canonical_mask.ndim == 2:
+            canonical_mask = canonical_mask.unsqueeze(0)
+        if canonical_mask.ndim != 3 or canonical_mask.shape[0] not in (1, 3):
+            raise ValueError(
+                "Canonical mask must be CHW with one or three channels, "
+                f"got {tuple(canonical_mask.shape)}"
+            )
+        canonical_mask = canonical_mask[0:1]
+        if aligned_landmarks is None:
+            contour_mask = torch.ones_like(canonical_mask)
+        else:
+            contour_mask = facial_contour_mask(
+                aligned_landmarks,
+                canonical_mask.shape[-2],
+                canonical_mask.shape[-1],
+                device=canonical_mask.device,
+                dtype=canonical_mask.dtype,
+            )
+        adapted_mask = adapt_canonical_mask(
+            canonical_mask, yaw, contour_mask=contour_mask
+        )
+        editable = (1.0 - adapted_mask).clamp(0.0, 1.0)
+        coverage_limit = max_editable_coverage()
+        coverage = float(editable.mean())
+        if coverage > coverage_limit:
+            editable = editable * (
+                float(coverage_limit) * (1.0 - 1e-6) / coverage
+            )
+        mask_image = (1.0 - editable).clamp(0.0, 1.0)
         masked_pixel_values = pixel_values * mask_image
         return pixel_values, masked_pixel_values, mask_image[0:1]
 
